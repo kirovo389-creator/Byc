@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           if [[ ! -f ./gradlew || ! -f ./app/build.gradle.kts ]]; then
             git clone --depth=1 https://github.com/VirtusVerbis/BTC_Anrdoid_Miner.git "$RUNNER_TEMP/upstream"
-            rsync -a --exclude='.git/' --exclude='.github/workflows/byc-android-release.yml' "$RUNNER_TEMP/upstream/" ./
+            rsync -a --exclude='.git/' --exclude='.github/' "$RUNNER_TEMP/upstream/" ./
           fi
 
           test -f ./gradlew
