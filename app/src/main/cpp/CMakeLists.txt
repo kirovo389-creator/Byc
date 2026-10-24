@@ -12,8 +12,9 @@ set(SHADER_UVEC4_SRC "${CMAKE_CURRENT_SOURCE_DIR}/miner_uvec4.comp")
 set(SHADER_UVEC4_SPV "${CMAKE_CURRENT_BINARY_DIR}/miner_uvec4.spv")
 set(SHADER_UVEC4_H   "${CMAKE_CURRENT_BINARY_DIR}/miner_uvec4_spv.h")
 
-# Try glslangValidator first (Vulkan SDK), then glslc (shaderc)
-find_program(GLSLANG_VALIDATOR NAMES glslangValidator glslc)
+# Prefer glslangValidator from Vulkan SDK; glslc uses a different CLI.
+find_program(GLSLANG_VALIDATOR NAMES glslangValidator)
+find_program(GLSLC_EXECUTABLE NAMES glslc)
 if(NOT GLSLANG_VALIDATOR)
     # Fallback: try common Vulkan SDK install paths (adjust version if needed)
     set(VULKAN_SDK_PATHS
@@ -32,8 +33,16 @@ if(NOT GLSLANG_VALIDATOR)
     endforeach()
 endif()
 if(GLSLANG_VALIDATOR)
-    # -V = compile to SPIR-V; SDK 1.4.x glslangValidator does not use --target-env
-    set(GLSLANG_FLAGS "-V" "-o")
+    # glslangValidator requires -V when targeting SPIR-V.
+    set(SHADER_COMPILER "${GLSLANG_VALIDATOR}")
+    set(SHADER_COMPILER_FLAGS "-V" "-o")
+elseif(GLSLC_EXECUTABLE)
+    # glslc emits SPIR-V by default; unlike glslangValidator it does not accept -V.
+    set(SHADER_COMPILER "${GLSLC_EXECUTABLE}")
+    set(SHADER_COMPILER_FLAGS "-o")
+endif()
+
+if(SHADER_COMPILER)
     set(SHADER_SCALAR_INC "${CMAKE_CURRENT_SOURCE_DIR}/sha256_compress_scalar.inc")
     set(SHADER_SECOND_SCALAR_INC "${CMAKE_CURRENT_SOURCE_DIR}/sha256_compress_second_scalar.inc")
     set(SHADER_SECOND_CPU_INC "${CMAKE_CURRENT_SOURCE_DIR}/sha256_compress_second_cpu.inc")
@@ -68,7 +77,7 @@ if(GLSLANG_VALIDATOR)
     endif()
     add_custom_command(
         OUTPUT "${SHADER_SCALAR_SPV}"
-        COMMAND ${GLSLANG_VALIDATOR} ${GLSLANG_FLAGS} "${SHADER_SCALAR_SPV}" "${SHADER_SCALAR_SRC}"
+        COMMAND ${SHADER_COMPILER} ${SHADER_COMPILER_FLAGS} "${SHADER_SCALAR_SPV}" "${SHADER_SCALAR_SRC}"
         DEPENDS "${SHADER_SCALAR_SRC}" "${SHADER_SCALAR_INC}" "${SHADER_SECOND_SCALAR_INC}" "${SHADER_FIRST_MID_SCALAR_INC}" "${SHADER_SECOND_CPU_INC}" "${SHADER_FIRST_MID_CPU_INC}"
         COMMENT "Compiling miner.comp to SPIR-V"
     )
@@ -84,7 +93,7 @@ if(GLSLANG_VALIDATOR)
     set(SHADER_UVEC4_INC "${CMAKE_CURRENT_SOURCE_DIR}/sha256_compress_uvec4.inc")
     add_custom_command(
         OUTPUT "${SHADER_UVEC4_SPV}"
-        COMMAND ${GLSLANG_VALIDATOR} ${GLSLANG_FLAGS} "${SHADER_UVEC4_SPV}" "${SHADER_UVEC4_SRC}"
+        COMMAND ${SHADER_COMPILER} ${SHADER_COMPILER_FLAGS} "${SHADER_UVEC4_SPV}" "${SHADER_UVEC4_SRC}"
         DEPENDS "${SHADER_UVEC4_SRC}" "${SHADER_UVEC4_INC}"
             "${SHADER_SECOND_UVEC4_INC}" "${SHADER_FIRST_MID_UVEC4_INC}"
             "${SHADER_SECOND_GEN}" "${SHADER_FIRST_MID_GEN}" "${SHADER_CODEGEN}"
@@ -103,7 +112,7 @@ if(GLSLANG_VALIDATOR)
     set(SHADER_UVEC2_INC "${CMAKE_CURRENT_SOURCE_DIR}/sha256_compress_uvec2.inc")
     add_custom_command(
         OUTPUT "${SHADER_UVEC2_SPV}"
-        COMMAND ${GLSLANG_VALIDATOR} ${GLSLANG_FLAGS} "${SHADER_UVEC2_SPV}" "${SHADER_UVEC2_SRC}"
+        COMMAND ${SHADER_COMPILER} ${SHADER_COMPILER_FLAGS} "${SHADER_UVEC2_SPV}" "${SHADER_UVEC2_SRC}"
         DEPENDS "${SHADER_UVEC2_SRC}" "${SHADER_UVEC2_INC}"
             "${SHADER_SECOND_UVEC2_INC}" "${SHADER_FIRST_MID_UVEC2_INC}"
             "${SHADER_SECOND_GEN}" "${SHADER_FIRST_MID_GEN}" "${SHADER_CODEGEN}"
