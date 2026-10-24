@@ -1,0 +1,477 @@
+package com.btcminer.android.config
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
+import android.content.res.ColorStateList
+import android.graphics.Rect
+import android.os.Bundle
+import android.os.IBinder
+import android.view.View
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import com.btcminer.android.AppLog
+import com.btcminer.android.R
+import com.btcminer.android.databinding.ActivityConfigBinding
+import com.btcminer.android.mining.MiningForegroundService
+import com.btcminer.android.util.BitcoinAddressValidator
+import com.btcminer.android.util.NumberFormatUtils
+import com.btcminer.android.network.StratumPinCapture
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.ColorUtils
+import com.google.android.material.slider.Slider
+import java.lang.Runtime
+import java.util.Locale
+
+class ConfigActivity : AppCompatActivity() {
+
+    private lateinit var binding: ActivityConfigBinding
+    private lateinit var repository: MiningConfigRepository
+    private var loadedConfig: MiningConfig? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityConfigBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+        repository = MiningConfigRepository(applicationContext)
+
+        supportActionBar?.setDisplayHomeAsUpEnabled(true)
+        title = getString(R.string.config_title)
+
+        loadConfig()
+        binding.configSliderCores.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configCoresValue.text = "${value.toInt()}"
+        })
+        binding.configSliderIntensity.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configMaxIntensityValue.text = formatIntensityLabel(value.toInt())
+        })
+        binding.configSliderStatusInterval.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configStatusIntervalValue.text = "${value.toInt()} ms"
+        })
+        binding.configSliderBatteryTemp.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configBatteryTempValue.text = "${value.toInt()} °C"
+        })
+        binding.configSliderGpuLocalSizeX.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configGpuLocalSizeXValue.text = formatGpuLocalSizeLabel(value.toInt())
+        })
+        binding.configSliderGpuHashesPerThread.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configGpuHashesPerThreadValue.text = formatGpuHashesPerThreadLabel(value.toInt())
+        })
+        binding.configSliderGpuHashesPerThread.setLabelFormatter { value ->
+            formatGpuHashesPerThreadLabel(value.toInt())
+        }
+        binding.configGpuEnabled.setOnCheckedChangeListener { _, _ ->
+            updateGpuControls()
+        }
+        binding.configSliderGpuUtilization.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configGpuUtilizationValue.text = formatIntensityLabel(value.toInt())
+        })
+        binding.configSliderThreadPriority.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configThreadPriorityValue.text = "${value.toInt()}"
+            applyThreadPrioritySliderAppearance(value)
+        })
+        binding.configSliderAlarmWakeInterval.addOnChangeListener(Slider.OnChangeListener { _, value, _ ->
+            binding.configAlarmWakeIntervalValue.text = formatAlarmWakeIntervalLabel(value.toInt())
+        })
+        binding.configSliderAlarmWakeInterval.setLabelFormatter { value ->
+            formatAlarmWakeIntervalLabel(value.toInt())
+        }
+        binding.configPartialWakeLock.setOnCheckedChangeListener { _, _ ->
+            updateAlarmSliderEnabled()
+        }
+        binding.configSave.setOnClickListener { saveConfig() }
+        binding.configSaveFloating.setOnClickListener { saveConfig() }
+        binding.configResetCounters.setOnClickListener { showResetCountersDialog() }
+        binding.configRequestBatteryExemption.setOnClickListener { requestBatteryExemption() }
+        binding.configOpenBatteryOptimizationSettings.setOnClickListener { openBatteryOptimizationSettings() }
+        updateFloatingButtonVisibility()
+        binding.configScroll.viewTreeObserver.addOnGlobalLayoutListener {
+            updateFloatingButtonVisibility()
+        }
+        binding.configScroll.setOnScrollChangeListener { _, _, _, _, _ ->
+            updateFloatingButtonVisibility()
+        }
+    }
+
+    private fun updateFloatingButtonVisibility() {
+        val rect = Rect()
+        val inFlowVisible = binding.configSave.getLocalVisibleRect(rect)
+        binding.configSaveFloating.visibility = if (inFlowVisible) View.GONE else View.VISIBLE
+    }
+
+    private fun updateAlarmSliderEnabled() {
+        val enabled = binding.configPartialWakeLock.isChecked
+        binding.configSliderAlarmWakeInterval.isEnabled = enabled
+        binding.configAlarmWakeIntervalValue.isEnabled = enabled
+        binding.configAlarmWakeIntervalLabel.isEnabled = enabled
+    }
+
+    private fun formatGpuLocalSizeLabel(localSizeX: Int): String =
+        getString(R.string.config_gpu_local_size_x_value, localSizeX)
+
+    private fun formatGpuHashesPerThreadLabel(sliderIndex: Int): String =
+        getString(
+            R.string.config_gpu_hashes_per_thread_value,
+            MiningConfig.gpuHashesPerThreadFromSliderIndex(sliderIndex),
+        )
+
+    private fun deviceMaxGpuLocalSizeX(): Int = GpuCapabilities.maxLocalSizeX()
+
+    private fun updateGpuControls() {
+        val vulkanAvailable = GpuCapabilities.isVulkanAvailable()
+        val gpuOn = binding.configGpuEnabled.isChecked
+        binding.configSliderGpuLocalSizeX.isEnabled = vulkanAvailable && gpuOn
+        binding.configGpuLocalSizeXValue.isEnabled = vulkanAvailable && gpuOn
+        binding.configSliderGpuHashesPerThread.isEnabled = vulkanAvailable && gpuOn
+        binding.configGpuHashesPerThreadValue.isEnabled = vulkanAvailable && gpuOn
+        binding.configGpuVulkanUnavailable.visibility = if (vulkanAvailable) View.GONE else View.VISIBLE
+
+        val maxLs = deviceMaxGpuLocalSizeX()
+        binding.configSliderGpuLocalSizeX.valueFrom = MiningConfig.GPU_LOCAL_SIZE_X_MIN.toFloat()
+        binding.configSliderGpuLocalSizeX.valueTo = maxLs.toFloat()
+        binding.configSliderGpuLocalSizeX.stepSize = MiningConfig.GPU_LOCAL_SIZE_X_STEP.toFloat()
+        val current = binding.configSliderGpuLocalSizeX.value.toInt()
+        val clamped = MiningConfig.clampGpuLocalSizeX(current, maxLs)
+        if (current != clamped) {
+            binding.configSliderGpuLocalSizeX.value = clamped.toFloat()
+        }
+        binding.configGpuLocalSizeXValue.text = formatGpuLocalSizeLabel(clamped)
+
+        binding.configSliderGpuHashesPerThread.valueFrom = 0f
+        binding.configSliderGpuHashesPerThread.valueTo = (MiningConfig.GPU_HASHES_PER_THREAD_OPTIONS.size - 1).toFloat()
+        binding.configSliderGpuHashesPerThread.stepSize = 1f
+        val hashesIndex = binding.configSliderGpuHashesPerThread.value.toInt()
+            .coerceIn(0, MiningConfig.GPU_HASHES_PER_THREAD_OPTIONS.lastIndex)
+        binding.configSliderGpuHashesPerThread.value = hashesIndex.toFloat()
+        binding.configGpuHashesPerThreadValue.text = formatGpuHashesPerThreadLabel(hashesIndex)
+
+        val (deviceName, driverName) = GpuLocalSizeHints.parseVulkanGpuInfo(GpuCapabilities.vulkanGpuInfo())
+        val hint = GpuLocalSizeHints.vendorHint(deviceName, driverName)
+        val maxLine = getString(R.string.config_gpu_local_size_max, maxLs)
+        val hintText = listOf(maxLine, hint).filter { it.isNotBlank() }.joinToString("\n")
+        binding.configGpuLocalSizeHint.text = hintText
+        binding.configGpuLocalSizeHint.visibility =
+            if (hintText.isNotBlank() && vulkanAvailable) View.VISIBLE else View.GONE
+    }
+
+    private fun formatIntensityLabel(percent: Int): String =
+        "${percent}% (${NumberFormatUtils.formatDurationMmSs(MiningConfig.intensityDelayMs(percent))})"
+
+    private fun formatAlarmWakeIntervalLabel(seconds: Int): String {
+        val s = seconds.coerceAtLeast(0)
+        if (s == 0) return "0 s (off)"
+        val minutesExact = s / 60.0
+        val minutesText = if (s % 60 == 0) {
+            (s / 60).toString()
+        } else {
+            String.format(Locale.US, "%.1f", minutesExact)
+        }
+        return "$s s ($minutesText min)"
+    }
+
+    private fun requestBatteryExemption() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (powerManager.isIgnoringBatteryOptimizations(packageName)) {
+            Toast.makeText(this, getString(R.string.config_battery_already_exempt), Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).setData(Uri.parse("package:$packageName"))
+            )
+        } catch (e: SecurityException) {
+            openBatteryOptimizationSettings()
+        }
+    }
+
+    private fun openBatteryOptimizationSettings() {
+        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+    }
+
+    private fun applyThreadPrioritySliderAppearance(value: Float) {
+        val v = value.coerceIn(MiningConfig.MINING_THREAD_PRIORITY_MIN.toFloat(), MiningConfig.MINING_THREAD_PRIORITY_MAX.toFloat())
+        val ratio = (v / MiningConfig.MINING_THREAD_PRIORITY_MIN.toFloat()).coerceIn(0f, 1f)
+        val dimColor = ContextCompat.getColor(this, R.color.slider_priority_track_low)
+        val brightColor = ContextCompat.getColor(this, R.color.slider_priority_track_high)
+        val blendedColor = ColorUtils.blendARGB(dimColor, brightColor, ratio)
+        binding.configSliderThreadPriority.setTrackActiveTintList(ColorStateList.valueOf(blendedColor))
+        val heightDp = 4f + ratio * 8f
+        val heightPx = (heightDp * resources.displayMetrics.density).toInt().coerceAtLeast(0)
+        binding.configSliderThreadPriority.setTrackHeight(heightPx)
+    }
+
+    override fun onSupportNavigateUp(): Boolean {
+        onBackPressedDispatcher.onBackPressed()
+        return true
+    }
+
+    private fun showResetCountersDialog() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.reset_counters_dialog_title)
+            .setMessage(R.string.reset_counters_dialog_message)
+            .setPositiveButton(R.string.reset_counters_yes) { _, _ ->
+                val conn = object : ServiceConnection {
+                    override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                        (binder as? MiningForegroundService.LocalBinder)?.getService()?.resetAllCounters()
+                        try { unbindService(this) } catch (_: Exception) { }
+                    }
+                    override fun onServiceDisconnected(name: ComponentName?) {}
+                }
+                bindService(
+                    Intent(this, MiningForegroundService::class.java),
+                    conn,
+                    Context.BIND_AUTO_CREATE
+                )
+            }
+            .setNegativeButton(R.string.reset_counters_no) { dialog, _ -> dialog.dismiss() }
+            .show()
+    }
+
+    private fun loadConfig() {
+        val c = repository.getConfig()
+        binding.configStratumUrl.editText?.setText(c.stratumUrl)
+        binding.configStratumPort.editText?.setText(if (c.stratumPort > 0) c.stratumPort.toString() else "")
+        binding.configStratumUser.editText?.setText(c.stratumUser)
+        binding.configStratumPass.editText?.setText(c.stratumPass)
+        binding.configBitcoinAddress.editText?.setText(c.bitcoinAddress)
+        binding.configLightningAddress.editText?.setText(c.lightningAddress)
+        binding.configWorkerName.editText?.setText(c.workerName)
+        binding.configPartialWakeLock.isChecked = c.usePartialWakeLock
+        binding.configUseLegacyAlarm.isChecked = c.useLegacyAlarm
+        val alarmSec = c.alarmWakeIntervalSec.coerceIn(MiningConfig.ALARM_WAKE_INTERVAL_SEC_MIN, MiningConfig.ALARM_WAKE_INTERVAL_SEC_MAX)
+        binding.configSliderAlarmWakeInterval.valueFrom = MiningConfig.ALARM_WAKE_INTERVAL_SEC_MIN.toFloat()
+        binding.configSliderAlarmWakeInterval.valueTo = MiningConfig.ALARM_WAKE_INTERVAL_SEC_MAX.toFloat()
+        binding.configSliderAlarmWakeInterval.stepSize = 1f
+        binding.configSliderAlarmWakeInterval.value = alarmSec.toFloat()
+        binding.configAlarmWakeIntervalValue.text = formatAlarmWakeIntervalLabel(alarmSec)
+        updateAlarmSliderEnabled()
+        val threadPriority = c.miningThreadPriority.coerceIn(MiningConfig.MINING_THREAD_PRIORITY_MIN, MiningConfig.MINING_THREAD_PRIORITY_MAX)
+        binding.configSliderThreadPriority.value = threadPriority.toFloat()
+        binding.configThreadPriorityValue.text = "$threadPriority"
+        applyThreadPrioritySliderAppearance(threadPriority.toFloat())
+        binding.configWifiOnly.isChecked = c.wifiOnly
+        binding.configMineOnlyWhenCharging.isChecked = c.mineOnlyWhenCharging
+        binding.configBatteryTempFahrenheit.isChecked = c.batteryTempFahrenheit
+        val batteryTempC = c.maxBatteryTempC.coerceIn(20, MiningConfig.MAX_BATTERY_TEMP_C)
+        binding.configSliderBatteryTemp.value = batteryTempC.toFloat()
+        binding.configBatteryTempValue.text = "$batteryTempC °C"
+        binding.configAutoTuningBatteryTemp.isChecked = c.autoTuningByBatteryTemp
+        binding.configHashrateTarget.editText?.setText(c.hashrateTargetHps?.toString() ?: "")
+        binding.configCpuUsageTarget.editText?.setText(c.cpuUsageTargetPercent?.toString() ?: "")
+        val maxCores = Runtime.getRuntime().availableProcessors()
+        binding.configSliderCores.valueFrom = 0f
+        binding.configSliderCores.valueTo = maxCores.toFloat()
+        val cores = c.maxWorkerThreads.coerceIn(0, maxCores)
+        binding.configSliderCores.value = cores.toFloat()
+        binding.configCoresValue.text = "$cores"
+        binding.configSliderIntensity.value = c.maxIntensityPercent.toFloat()
+        binding.configMaxIntensityValue.text = formatIntensityLabel(c.maxIntensityPercent)
+        binding.configGpuEnabled.isChecked = c.gpuEnabled
+        val maxLs = deviceMaxGpuLocalSizeX()
+        binding.configSliderGpuLocalSizeX.valueFrom = MiningConfig.GPU_LOCAL_SIZE_X_MIN.toFloat()
+        binding.configSliderGpuLocalSizeX.valueTo = maxLs.toFloat()
+        binding.configSliderGpuLocalSizeX.stepSize = MiningConfig.GPU_LOCAL_SIZE_X_STEP.toFloat()
+        val localSizeX = c.clampedGpuLocalSizeX(maxLs)
+        binding.configSliderGpuLocalSizeX.value = localSizeX.toFloat()
+        binding.configGpuLocalSizeXValue.text = formatGpuLocalSizeLabel(localSizeX)
+        val hashesPerThreadIndex = MiningConfig.gpuHashesPerThreadSliderIndex(c.gpuHashesPerThread)
+        binding.configSliderGpuHashesPerThread.valueFrom = 0f
+        binding.configSliderGpuHashesPerThread.valueTo = (MiningConfig.GPU_HASHES_PER_THREAD_OPTIONS.size - 1).toFloat()
+        binding.configSliderGpuHashesPerThread.stepSize = 1f
+        binding.configSliderGpuHashesPerThread.value = hashesPerThreadIndex.toFloat()
+        binding.configGpuHashesPerThreadValue.text = formatGpuHashesPerThreadLabel(hashesPerThreadIndex)
+        updateGpuControls()
+        binding.configSliderGpuUtilization.value = c.gpuUtilizationPercent.coerceIn(MiningConfig.GPU_UTILIZATION_MIN, MiningConfig.GPU_UTILIZATION_MAX).toFloat()
+        binding.configGpuUtilizationValue.text = formatIntensityLabel(c.gpuUtilizationPercent.coerceIn(MiningConfig.GPU_UTILIZATION_MIN, MiningConfig.GPU_UTILIZATION_MAX))
+        val statusMs = c.statusUpdateIntervalMs.coerceIn(MiningConfig.STATUS_UPDATE_INTERVAL_MIN, MiningConfig.STATUS_UPDATE_INTERVAL_MAX)
+        binding.configSliderStatusInterval.value = statusMs.toFloat()
+        binding.configStatusIntervalValue.text = "$statusMs ms"
+        applyCpuShaFlavorRadios()
+        binding.configRadioGroupCpuSha.check(radioIdForFlavor(c.cpuSha256Flavor))
+        binding.configRadioGroupGpuSha.check(radioIdForGpuSha256Mode(c.gpuSha256Mode))
+        loadedConfig = c
+    }
+
+    private fun radioIdForFlavor(f: CpuSha256Flavor): Int = when (f) {
+        CpuSha256Flavor.HW_SHA2_MIDSTATE -> R.id.config_radio_cpu_sha_0
+        CpuSha256Flavor.HW_SHA2 -> R.id.config_radio_cpu_sha_1
+        CpuSha256Flavor.NEON4_MIDSTATE -> R.id.config_radio_cpu_sha_2
+        CpuSha256Flavor.NEON4 -> R.id.config_radio_cpu_sha_3
+        CpuSha256Flavor.SCALAR_MIDSTATE -> R.id.config_radio_cpu_sha_4
+        CpuSha256Flavor.SCALAR -> R.id.config_radio_cpu_sha_5
+    }
+
+    private fun flavorForCheckedRadio(): CpuSha256Flavor = when (binding.configRadioGroupCpuSha.checkedRadioButtonId) {
+        R.id.config_radio_cpu_sha_0 -> CpuSha256Flavor.HW_SHA2_MIDSTATE
+        R.id.config_radio_cpu_sha_1 -> CpuSha256Flavor.HW_SHA2
+        R.id.config_radio_cpu_sha_2 -> CpuSha256Flavor.NEON4_MIDSTATE
+        R.id.config_radio_cpu_sha_3 -> CpuSha256Flavor.NEON4
+        R.id.config_radio_cpu_sha_4 -> CpuSha256Flavor.SCALAR_MIDSTATE
+        R.id.config_radio_cpu_sha_5 -> CpuSha256Flavor.SCALAR
+        else -> CpuSha256Flavor.SCALAR
+    }
+
+    private fun radioIdForGpuSha256Mode(mode: GpuSha256Mode): Int = when (mode) {
+        GpuSha256Mode.GPU_MIDSTATE -> R.id.config_radio_gpu_sha_mid
+        GpuSha256Mode.GPU_UVEC2_MIDSTATE -> R.id.config_radio_gpu_sha_uvec2_mid
+        GpuSha256Mode.GPU_UVEC4_MIDSTATE -> R.id.config_radio_gpu_sha_uvec4_mid
+        GpuSha256Mode.GPU_FULL -> R.id.config_radio_gpu_sha_full
+    }
+
+    private fun gpuSha256ModeForCheckedRadio(): GpuSha256Mode = when (binding.configRadioGroupGpuSha.checkedRadioButtonId) {
+        R.id.config_radio_gpu_sha_mid -> GpuSha256Mode.GPU_MIDSTATE
+        R.id.config_radio_gpu_sha_uvec2_mid -> GpuSha256Mode.GPU_UVEC2_MIDSTATE
+        R.id.config_radio_gpu_sha_uvec4_mid -> GpuSha256Mode.GPU_UVEC4_MIDSTATE
+        R.id.config_radio_gpu_sha_full -> GpuSha256Mode.GPU_FULL
+        else -> GpuSha256Mode.GPU_FULL
+    }
+
+    private fun applyCpuShaFlavorRadios() {
+        val caps = CpuShaCapabilities
+        val suffix = getString(R.string.config_cpu_sha_unsupported_suffix)
+        fun applyRb(rb: com.google.android.material.radiobutton.MaterialRadioButton, flavor: CpuSha256Flavor, label: String) {
+            val ok = caps.isSelectable(flavor)
+            rb.isEnabled = ok
+            rb.isClickable = ok
+            rb.alpha = if (ok) 1f else 0.55f
+            rb.text = if (ok) label else label + suffix
+        }
+        applyRb(binding.configRadioCpuSha0, CpuSha256Flavor.HW_SHA2_MIDSTATE, getString(R.string.config_cpu_sha_hw_mid))
+        applyRb(binding.configRadioCpuSha1, CpuSha256Flavor.HW_SHA2, getString(R.string.config_cpu_sha_hw))
+        applyRb(binding.configRadioCpuSha2, CpuSha256Flavor.NEON4_MIDSTATE, getString(R.string.config_cpu_sha_neon_mid))
+        applyRb(binding.configRadioCpuSha3, CpuSha256Flavor.NEON4, getString(R.string.config_cpu_sha_neon))
+        applyRb(binding.configRadioCpuSha4, CpuSha256Flavor.SCALAR_MIDSTATE, getString(R.string.config_cpu_sha_scalar_mid))
+        applyRb(binding.configRadioCpuSha5, CpuSha256Flavor.SCALAR, getString(R.string.config_cpu_sha_scalar))
+    }
+
+    private fun saveConfig() {
+        val stratumUrlRaw = binding.configStratumUrl.editText?.text?.toString()?.trim() ?: ""
+        val port = binding.configStratumPort.editText?.text?.toString()?.toIntOrNull() ?: MiningConfig.DEFAULT_STRATUM_PORT
+        val portCoerced = port.coerceIn(1, 65535)
+        val useTls = StratumPinCapture.indicatesTls(stratumUrlRaw, portCoerced)
+        val pinThisPoolChecked = binding.configPinThisPool.isChecked
+
+        val requestedFlavor = flavorForCheckedRadio()
+        val cpuShaFlavor =
+            if (CpuShaCapabilities.isSelectable(requestedFlavor)) requestedFlavor
+            else CpuShaCapabilities.coerceToSupported(requestedFlavor)
+
+        val gpuSha256Mode = gpuSha256ModeForCheckedRadio()
+
+        val config = MiningConfig(
+            stratumUrl = MiningConfig.sanitize(stratumUrlRaw, MiningConfig.MAX_STRATUM_URL_LEN),
+            stratumPort = portCoerced,
+            stratumUser = MiningConfig.sanitize(binding.configStratumUser.editText?.text?.toString()?.trim() ?: "", MiningConfig.MAX_STRATUM_USER_LEN),
+            stratumPass = MiningConfig.sanitize(binding.configStratumPass.editText?.text?.toString() ?: "", MiningConfig.MAX_STRATUM_PASS_LEN),
+            bitcoinAddress = MiningConfig.sanitize(binding.configBitcoinAddress.editText?.text?.toString()?.trim() ?: "", MiningConfig.MAX_BITCOIN_ADDRESS_LEN),
+            lightningAddress = MiningConfig.sanitize(binding.configLightningAddress.editText?.text?.toString()?.trim() ?: "", MiningConfig.MAX_LIGHTNING_ADDRESS_LEN),
+            workerName = MiningConfig.sanitize(binding.configWorkerName.editText?.text?.toString()?.trim() ?: "", MiningConfig.MAX_WORKER_NAME_LEN),
+            usePartialWakeLock = binding.configPartialWakeLock.isChecked,
+            useLegacyAlarm = binding.configUseLegacyAlarm.isChecked,
+            miningThreadPriority = binding.configSliderThreadPriority.value.toInt().coerceIn(
+                MiningConfig.MINING_THREAD_PRIORITY_MIN,
+                MiningConfig.MINING_THREAD_PRIORITY_MAX
+            ),
+            alarmWakeIntervalSec = binding.configSliderAlarmWakeInterval.value.toInt().coerceIn(
+                MiningConfig.ALARM_WAKE_INTERVAL_SEC_MIN,
+                MiningConfig.ALARM_WAKE_INTERVAL_SEC_MAX
+            ),
+            wifiOnly = binding.configWifiOnly.isChecked,
+            mineOnlyWhenCharging = binding.configMineOnlyWhenCharging.isChecked,
+            batteryTempFahrenheit = binding.configBatteryTempFahrenheit.isChecked,
+            maxBatteryTempC = binding.configSliderBatteryTemp.value.toInt().coerceIn(1, MiningConfig.MAX_BATTERY_TEMP_C),
+            autoTuningByBatteryTemp = binding.configAutoTuningBatteryTemp.isChecked,
+            hashrateTargetHps = binding.configHashrateTarget.editText?.text?.toString()?.trim()?.toDoubleOrNull(),
+            cpuUsageTargetPercent = binding.configCpuUsageTarget.editText?.text?.toString()?.trim()?.toIntOrNull()?.coerceIn(MiningConfig.CPU_USAGE_TARGET_MIN, MiningConfig.CPU_USAGE_TARGET_MAX),
+            maxIntensityPercent = binding.configSliderIntensity.value.toInt().coerceIn(
+                MiningConfig.MAX_INTENSITY_MIN,
+                MiningConfig.MAX_INTENSITY_MAX
+            ),
+            maxWorkerThreads = binding.configSliderCores.value.toInt().coerceIn(
+                0,
+                Runtime.getRuntime().availableProcessors(),
+            ),
+            statusUpdateIntervalMs = binding.configSliderStatusInterval.value.toInt().coerceIn(
+                MiningConfig.STATUS_UPDATE_INTERVAL_MIN,
+                MiningConfig.STATUS_UPDATE_INTERVAL_MAX
+            ),
+            gpuEnabled = binding.configGpuEnabled.isChecked,
+            gpuLocalSizeX = MiningConfig.clampGpuLocalSizeX(
+                binding.configSliderGpuLocalSizeX.value.toInt(),
+                deviceMaxGpuLocalSizeX(),
+            ),
+            gpuHashesPerThread = MiningConfig.gpuHashesPerThreadFromSliderIndex(
+                binding.configSliderGpuHashesPerThread.value.toInt(),
+            ),
+            gpuUtilizationPercent = binding.configSliderGpuUtilization.value.toInt().coerceIn(
+                MiningConfig.GPU_UTILIZATION_MIN,
+                MiningConfig.GPU_UTILIZATION_MAX
+            ),
+            cpuSha256Flavor = cpuShaFlavor,
+            gpuSha256Mode = gpuSha256Mode,
+        )
+
+        if (config.bitcoinAddress.isNotBlank() && !BitcoinAddressValidator.isValidAddress(config.bitcoinAddress)) {
+            Toast.makeText(this, R.string.config_invalid_bitcoin_address, Toast.LENGTH_LONG).show()
+            return
+        }
+        val stratumPayout = BitcoinAddressValidator.stratumPayoutAddressCandidate(config.stratumUser)
+        if (stratumPayout != null && !BitcoinAddressValidator.isValidAddress(stratumPayout)) {
+            Toast.makeText(this, R.string.config_invalid_stratum_payout_address, Toast.LENGTH_LONG).show()
+            return
+        }
+
+        if (pinThisPoolChecked && config.stratumUrl.isNotBlank() && useTls) {
+            val host = StratumPinCapture.normalizeHost(config.stratumUrl)
+            if (host.isBlank()) {
+                Toast.makeText(this, R.string.config_could_not_pin_certificate, Toast.LENGTH_LONG).show()
+                return
+            }
+            val progressDialog = AlertDialog.Builder(this)
+                .setMessage(R.string.config_pinning_pool_certificate)
+                .setCancelable(false)
+                .show()
+            Thread {
+                try {
+                    val pin = StratumPinCapture.capturePin(host, config.stratumPort)
+                    runOnUiThread {
+                        progressDialog.dismiss()
+                        repository.saveStratumPin(host, pin)
+                        binding.configPinThisPool.isChecked = false
+                        repository.saveConfig(config)
+                        startService(Intent(this@ConfigActivity, MiningForegroundService::class.java).apply {
+                            action = MiningForegroundService.ACTION_RESTART
+                        })
+                        Toast.makeText(this@ConfigActivity, R.string.config_saved, Toast.LENGTH_SHORT).show()
+                        finishAndReturnToMainDashboard()
+                    }
+                } catch (e: Exception) {
+                    val errMsg = e.message
+                    AppLog.e("Config") { "Pin certificate failed: $errMsg" }
+                    runOnUiThread {
+                        progressDialog.dismiss()
+                        val toastText = getString(R.string.config_could_not_pin_certificate) + "\n" + (errMsg ?: "Unknown error")
+                        Toast.makeText(this@ConfigActivity, toastText, Toast.LENGTH_LONG).show()
+                    }
+                }
+            }.start()
+            return
+        }
+
+        if (config == loadedConfig) {
+            finishAndReturnToMainDashboard()
+            return
+        }
+        repository.saveConfig(config)
+        startService(Intent(this, MiningForegroundService::class.java).apply {
+            action = MiningForegroundService.ACTION_RESTART
+        })
+        Toast.makeText(this, R.string.config_saved, Toast.LENGTH_SHORT).show()
+        finishAndReturnToMainDashboard()
+    }
+}

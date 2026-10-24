@@ -1,0 +1,214 @@
+#include "sha256.h"
+#include "sha256_scan.h"
+#include "btc_header_sha256.h"
+#include <jni.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <string.h>
+
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+
+#define BLOCK_HEADER_SIZE 80
+#define HEADER_PREFIX_SIZE 76
+#define HASH_SIZE 32
+/* JNI jlong[0] for CPU scan only (values not shared with vulkan_miner.c). */
+#define CPU_JNI_STATUS_MISS 0
+#define CPU_JNI_STATUS_HIT 1
+#define CPU_JNI_STATUS_INTERRUPTED (-3)
+#define CPU_JNI_STATUS_FLAVOR_ERROR (-4)
+#define CPU_JNI_STATUS_JNI_ARG_ERROR (-5)
+
+/* Set by cpuRequestInterrupt; checked every 64k iterations in nonce scan. */
+atomic_int g_cpu_interrupt_requested = 0;
+
+/* NIST test vector: SHA-256("abc") = 0xba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad */
+static const uint8_t TEST_ABC_HASH[HASH_SIZE] = {
+    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+    0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+    0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+    0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+};
+
+JNIEXPORT jstring JNICALL
+Java_com_btcminer_android_mining_NativeMiner_nativeVersion(JNIEnv *env, jclass clazz) {
+    (void)clazz;
+    return (*env)->NewStringUTF(env, "1.0.0");
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_btcminer_android_mining_NativeMiner_nativeTestSha256(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    const uint8_t abc[] = { 'a', 'b', 'c' };
+    uint8_t out[HASH_SIZE];
+    sha256(abc, sizeof(abc), out);
+    return (memcmp(out, TEST_ABC_HASH, HASH_SIZE) == 0) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_btcminer_android_mining_NativeMiner_nativeHashBlockHeader(JNIEnv *env, jclass clazz,
+                                                                   jbyteArray headerJava) {
+    (void)clazz;
+    if (!headerJava || (*env)->GetArrayLength(env, headerJava) != BLOCK_HEADER_SIZE) {
+        return NULL;
+    }
+    uint8_t header[BLOCK_HEADER_SIZE];
+    uint8_t out[HASH_SIZE];
+    (*env)->GetByteArrayRegion(env, headerJava, 0, BLOCK_HEADER_SIZE, (jbyte *)header);
+    sha256_double(header, BLOCK_HEADER_SIZE, out);
+    jbyteArray result = (*env)->NewByteArray(env, HASH_SIZE);
+    if (result) {
+        (*env)->SetByteArrayRegion(env, result, 0, HASH_SIZE, (jbyte *)out);
+    }
+    return result;
+}
+
+JNIEXPORT void JNICALL
+Java_com_btcminer_android_mining_NativeMiner_cpuRequestInterrupt(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    atomic_store_explicit(&g_cpu_interrupt_requested, 1, memory_order_release);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_btcminer_android_mining_NativeMiner_nativeHwcapSha2(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+#if defined(__aarch64__)
+    unsigned long hw = getauxval(AT_HWCAP);
+    return ((hw & HWCAP_SHA2) != 0) ? JNI_TRUE : JNI_FALSE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+/** GPU midstate vs full double-SHA host check; logs tag GPU_SHA_SelfTest. */
+JNIEXPORT jboolean JNICALL
+Java_com_btcminer_android_mining_NativeMiner_gpuShaHostSelftest(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    return gpu_sha_host_selftest() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_btcminer_android_mining_NativeMiner_nativeSelfTestCpuSha256Flavor(JNIEnv *env, jclass clazz,
+                                                                           jint flavor) {
+    (void)env;
+    (void)clazz;
+    if (flavor < 0 || flavor > 5) {
+        return JNI_FALSE;
+    }
+    return cpu_sha_selftest_flavor((int)flavor) ? JNI_TRUE : JNI_FALSE;
+}
+
+/* Parameter order must match Kotlin [NativeMiner.cpuJobSessionBegin]. */
+JNIEXPORT void JNICALL
+Java_com_btcminer_android_mining_NativeMiner_cpuJobSessionBegin(JNIEnv *env, jclass clazz, jbyteArray header76Java,
+                                                                jbyteArray targetJava, jint flavor) {
+    (void)clazz;
+    if (!header76Java || !targetJava ||
+        (*env)->GetArrayLength(env, header76Java) != HEADER_PREFIX_SIZE ||
+        (*env)->GetArrayLength(env, targetJava) != HASH_SIZE ||
+        flavor < 0 || flavor > 5) {
+        return;
+    }
+    uint8_t header76[HEADER_PREFIX_SIZE];
+    uint8_t target[HASH_SIZE];
+    (*env)->GetByteArrayRegion(env, header76Java, 0, HEADER_PREFIX_SIZE, (jbyte *)header76);
+    (*env)->GetByteArrayRegion(env, targetJava, 0, HASH_SIZE, (jbyte *)target);
+    cpu_job_session_begin(header76, target, (int)flavor);
+}
+
+JNIEXPORT void JNICALL
+Java_com_btcminer_android_mining_NativeMiner_cpuJobSessionEnd(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    cpu_job_session_end();
+}
+
+/* Parameter order must match Kotlin [NativeMiner.nativeScanNoncesInto] (out is last). */
+JNIEXPORT void JNICALL
+Java_com_btcminer_android_mining_NativeMiner_nativeScanNoncesInto(JNIEnv *env, jclass clazz, jbyteArray header76Java,
+                                                                  jint nonceStart, jint nonceEnd, jbyteArray targetJava,
+                                                                  jint flavor, jlongArray outJava) {
+    (void)clazz;
+    if (!outJava || (*env)->GetArrayLength(env, outJava) < 2) {
+        return;
+    }
+    jlong *out = (*env)->GetLongArrayElements(env, outJava, NULL);
+    if (!out)
+        return;
+    const int sessionActive = cpu_job_session_active();
+    if (!sessionActive) {
+        if (!header76Java || !targetJava ||
+            (*env)->GetArrayLength(env, header76Java) != HEADER_PREFIX_SIZE ||
+            (*env)->GetArrayLength(env, targetJava) != HASH_SIZE) {
+            out[0] = (jlong)CPU_JNI_STATUS_JNI_ARG_ERROR;
+            out[1] = 0;
+            (*env)->ReleaseLongArrayElements(env, outJava, out, 0);
+            return;
+        }
+    } else {
+        if (header76Java && (*env)->GetArrayLength(env, header76Java) != HEADER_PREFIX_SIZE) {
+            out[0] = (jlong)CPU_JNI_STATUS_JNI_ARG_ERROR;
+            out[1] = 0;
+            (*env)->ReleaseLongArrayElements(env, outJava, out, 0);
+            return;
+        }
+        if (targetJava && (*env)->GetArrayLength(env, targetJava) != HASH_SIZE) {
+            out[0] = (jlong)CPU_JNI_STATUS_JNI_ARG_ERROR;
+            out[1] = 0;
+            (*env)->ReleaseLongArrayElements(env, outJava, out, 0);
+            return;
+        }
+    }
+    if (flavor < 0 || flavor > 5) {
+        out[0] = (jlong)CPU_JNI_STATUS_FLAVOR_ERROR;
+        out[1] = 0;
+        (*env)->ReleaseLongArrayElements(env, outJava, out, 0);
+        return;
+    }
+    if (sessionActive && flavor != cpu_job_session_flavor()) {
+        out[0] = (jlong)CPU_JNI_STATUS_FLAVOR_ERROR;
+        out[1] = 0;
+        (*env)->ReleaseLongArrayElements(env, outJava, out, 0);
+        return;
+    }
+
+    uint8_t header76[HEADER_PREFIX_SIZE];
+    uint8_t target[HASH_SIZE];
+    if (!sessionActive) {
+        (*env)->GetByteArrayRegion(env, header76Java, 0, HEADER_PREFIX_SIZE, (jbyte *)header76);
+        (*env)->GetByteArrayRegion(env, targetJava, 0, HASH_SIZE, (jbyte *)target);
+    }
+
+    uint32_t start = (uint32_t)nonceStart;
+    uint32_t end = (uint32_t)nonceEnd;
+    atomic_store_explicit(&g_cpu_interrupt_requested, 0, memory_order_relaxed);
+    int ret;
+    if (sessionActive) {
+        ret = scan_nonces_dispatch_session(start, end);
+    } else {
+        ret = scan_nonces_dispatch((int)flavor, header76, start, end, target);
+    }
+    if (ret >= 0) {
+        out[0] = (jlong)CPU_JNI_STATUS_HIT;
+        out[1] = (jlong)(uint32_t)ret;
+    } else if (ret == -1) {
+        out[0] = (jlong)CPU_JNI_STATUS_MISS;
+        out[1] = 0;
+    } else if (ret == -3) {
+        out[0] = (jlong)CPU_JNI_STATUS_INTERRUPTED;
+        out[1] = 0;
+    } else if (ret == -4) {
+        out[0] = (jlong)CPU_JNI_STATUS_FLAVOR_ERROR;
+        out[1] = 0;
+    } else {
+        out[0] = (jlong)CPU_JNI_STATUS_MISS;
+        out[1] = 0;
+    }
+    (*env)->ReleaseLongArrayElements(env, outJava, out, 0);
+}

@@ -1,0 +1,207 @@
+package com.btcminer.android.mining
+
+import java.math.BigDecimal
+import java.math.BigInteger
+import java.math.RoundingMode
+import java.security.MessageDigest
+import kotlin.math.pow
+
+/**
+ * Builds 76-byte block header prefix and 32-byte target from Stratum job + difficulty.
+ * Merkle root matches [NerdMiner_v2 calculateMiningData](https://github.com/BitMaker-hub/NerdMiner_v2) (concat + double-SHA256 per branch).
+ * Share target is difficulty-1 max target divided by pool difficulty (Stratum / truediffone-style).
+ */
+object StratumHeaderBuilder {
+
+    private val sha256 = MessageDigest.getInstance("SHA-256")
+
+    /** Unsigned 256-bit maximum; used to clamp absurdly easy share targets. */
+    private val UINT256_MAX: BigInteger = BigInteger.ONE.shiftLeft(256).subtract(BigInteger.ONE)
+
+    private fun sha256(data: ByteArray): ByteArray = sha256.digest(data)
+    private fun doubleSha256(data: ByteArray): ByteArray = sha256(sha256(data))
+
+    /** Decode hex string to byte array (big-endian). */
+    fun hexToBytes(hex: String): ByteArray {
+        val s = hex.replace(" ", "").lowercase()
+        require(s.length % 2 == 0) { "Even length hex required" }
+        return ByteArray(s.length / 2) { i ->
+            s.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    /** Encode bytes to hex. */
+    fun bytesToHex(bytes: ByteArray): String =
+        bytes.joinToString("") { "%02x".format(it) }
+
+    /**
+     * Stratum / public-pool `swapEndianWords`: for each 4-byte word, swap byte order (notify `prevhash` param).
+     */
+    internal fun swapEndianWords32(b: ByteArray): ByteArray {
+        require(b.size == 32) { "prevhash must be 32 bytes" }
+        val out = b.copyOf()
+        var i = 0
+        while (i < 32) {
+            val t0 = out[i]
+            val t1 = out[i + 1]
+            out[i] = out[i + 3]
+            out[i + 1] = out[i + 2]
+            out[i + 2] = t1
+            out[i + 3] = t0
+            i += 4
+        }
+        return out
+    }
+
+    /** Left-pad Stratum hex fields to 8 nibbles (4 bytes LE on wire). */
+    internal fun normalize8Hex(hex: String): String {
+        val s = hex.replace(" ", "").lowercase()
+        require(s.length % 2 == 0) { "Even length hex required" }
+        return s.padStart(8, '0')
+    }
+
+    /**
+     * Build merkle root: coinbase = coinb1 + extranonce1 + extranonce2 + coinb2,
+     * then H = double-SHA256(coinbase); for each branch digest (32 bytes from hex), H = double-SHA256(H || branch).
+     * Same as NerdMiner_v2 `calculateMiningData` (no byte reversal inside the merkle loop).
+     */
+    fun buildMerkleRoot(
+        coinb1Hex: String,
+        coinb2Hex: String,
+        extranonce1Hex: String,
+        extranonce2Hex: String,
+        merkleBranchHex: List<String>,
+    ): ByteArray {
+        val coinb1 = hexToBytes(coinb1Hex)
+        val coinb2 = hexToBytes(coinb2Hex)
+        val en1 = hexToBytes(extranonce1Hex)
+        val en2 = hexToBytes(extranonce2Hex)
+        val coinbase = coinb1 + en1 + en2 + coinb2
+        var hash = doubleSha256(coinbase)
+        for (branchHex in merkleBranchHex) {
+            val branch = hexToBytes(branchHex)
+            hash = doubleSha256(hash + branch)
+        }
+        return hash
+    }
+
+    /** Pad or trim to 4 bytes little-endian from hex (use [normalize8Hex] for pool-style short strings). */
+    private fun hexTo4BytesLE(hex: String): ByteArray {
+        val b = hexToBytes(hex).reversedArray()
+        return when {
+            b.size >= 4 -> b.copyOfRange(0, 4)
+            else -> ByteArray(4) { i -> if (i < b.size) b[i] else 0 }
+        }
+    }
+
+    /**
+     * Build 76-byte header prefix (no nonce). Version, prevhash, merkle_root, ntime, nbits; nonce appended later.
+     */
+    fun buildHeader76(
+        job: StratumJob,
+        merkleRoot: ByteArray,
+    ): ByteArray {
+        require(merkleRoot.size == 32) { "Merkle root must be 32 bytes" }
+        val version = hexTo4BytesLE(normalize8Hex(job.versionHex))
+        val prevhash = swapEndianWords32(hexToBytes(job.prevhashHex))
+        val ntime = hexTo4BytesLE(normalize8Hex(job.ntimeHex))
+        val nbits = hexTo4BytesLE(normalize8Hex(job.nbitsHex))
+        return version + prevhash + merkleRoot + ntime + nbits
+    }
+
+    /**
+     * Build 32-byte share target (big-endian) for local PoW: `max_target / difficulty` (floor),
+     * where `max_target` is Bitcoin difficulty-1 (nbits 0x1d00ffff). Easier targets when the pool
+     * sends difficulty below 1.0 are not capped back to difficulty 1 (NerdMiner / low-diff Stratum).
+     * Values above 2^256-1
+     * clamp to all 0xFF bytes (easiest representable target).
+     */
+    fun buildTargetFromDifficulty(difficulty: Double): ByteArray {
+        val maxTarget = BigInteger("00000000ffff0000000000000000000000000000000000000000000000000000", 16)
+        if (difficulty <= 0.0) return bigIntegerToTarget32(maxTarget)
+        var targetValue = maxTarget.toBigDecimal()
+            .divide(difficulty.toBigDecimal(), 0, RoundingMode.DOWN)
+            .toBigInteger()
+        if (targetValue > UINT256_MAX) targetValue = UINT256_MAX
+        return bigIntegerToTarget32(targetValue)
+    }
+
+    private fun bigIntegerToTarget32(target: BigInteger): ByteArray {
+        val bytes = target.toByteArray()
+        return when {
+            bytes.size >= 32 -> bytes.takeLast(32).toByteArray()
+            bytes.isEmpty() -> ByteArray(32) { 0xff.toByte() }
+            else -> ByteArray(32) { i -> if (i < 32 - bytes.size) 0 else bytes[i - (32 - bytes.size)] }
+        }
+    }
+
+    /** Append nonce (4 bytes, little-endian) to 76-byte header. [nonceU32] is the unsigned 32-bit value. */
+    fun header76WithNonce(header76: ByteArray, nonceU32: Long): ByteArray {
+        require(header76.size == 76)
+        val n = nonceU32 and 0xFFFFFFFFL
+        val nonceBytes = byteArrayOf(
+            (n and 0xffL).toInt().toByte(),
+            ((n shr 8) and 0xffL).toInt().toByte(),
+            ((n shr 16) and 0xffL).toInt().toByte(),
+            ((n shr 24) and 0xffL).toInt().toByte(),
+        )
+        return header76 + nonceBytes
+    }
+
+    /** @see header76WithNonce(header76, Long) */
+    fun header76WithNonce(header76: ByteArray, nonce: Int): ByteArray =
+        header76WithNonce(header76, nonce.toLong() and 0xFFFFFFFFL)
+
+    /** Bitcoin "difficulty 1" target as double (max_target numeric value). */
+    private const val TRUEDIFFONE = 26959535291011309493156476344723991336010898738574164086137773096960.0
+
+    /**
+     * Compute share difficulty from 80-byte block header (double-SHA256 hash, then truediffone / hash).
+     * Matches public-pool `DifficultyUtils` / bitcoinjs PoW integer: digest bytes as **little-endian** uint256
+     * (MSB = `digest[31]`), same as `BigInteger(1, hash.reversedArray())`.
+     */
+    fun difficultyFromHeader80(header80: ByteArray): Double {
+        require(header80.size == 80) { "Header must be 80 bytes" }
+        val hash = doubleSha256(header80)
+        val hashValue = uint256LeBufferAsBigInteger(hash)
+        if (hashValue.signum() == 0) return TRUEDIFFONE
+        val diff = BigDecimal(TRUEDIFFONE.toString()).divide(BigDecimal(hashValue), 16, RoundingMode.HALF_UP)
+        return diff.toDouble()
+    }
+
+    /** 32-byte SHA256d digest as unsigned 256-bit integer (LE buffer: index 0 = LSB). */
+    private fun uint256LeBufferAsBigInteger(hash: ByteArray): BigInteger {
+        require(hash.size == 32)
+        return BigInteger(1, hash.reversedArray())
+    }
+
+    /**
+     * Chain network difficulty from Stratum `nbits` (notify param 6), same compact formula as public-pool
+     * `calculateNetworkDifficulty`: `maxTarget / (mantissa * 256^(exponent-3))`.
+     */
+    fun networkDifficultyFromNbitsHex(nbitsHex: String): Double? {
+        val n = nbitsHexToUInt32(nbitsHex) ?: return null
+        val mantissa = n and 0x007fffffL
+        val exponent = ((n shr 24) and 0xffL).toInt()
+        if (mantissa == 0L) return null
+        val target = mantissa.toDouble() * 256.0.pow(exponent - 3)
+        if (!target.isFinite() || target <= 0.0) return null
+        val maxTarget = 2.0.pow(208) * 65535.0
+        return maxTarget / target
+    }
+
+    /** Parse Stratum `nbits` hex as unsigned 32-bit (at most 8 hex digits after normalize). */
+    private fun nbitsHexToUInt32(hex: String): Long? {
+        val s = hex.replace(" ", "").lowercase()
+        if (s.isEmpty() || s.length % 2 != 0) return null
+        val eight = when {
+            s.length <= 8 -> s.padStart(8, '0')
+            else -> s.takeLast(8)
+        }
+        return try {
+            java.lang.Long.parseUnsignedLong(eight, 16)
+        } catch (_: NumberFormatException) {
+            null
+        }
+    }
+}

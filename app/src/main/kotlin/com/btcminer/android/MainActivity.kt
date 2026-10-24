@@ -1,0 +1,2692 @@
+package com.btcminer.android
+
+import android.app.PictureInPictureParams
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.ServiceConnection
+import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.Rect
+import android.os.BatteryManager
+import android.os.Build
+import android.os.Bundle
+import android.util.Rational
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.ViewTreeObserver
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Lifecycle
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.FragmentManager
+import androidx.lifecycle.lifecycleScope
+import com.btcminer.android.config.ConfigHubActivity
+import com.btcminer.android.config.GpuCapabilities
+import com.btcminer.android.config.MiningConfig
+import com.btcminer.android.ui.chart.TelemetryLeftYAxisRenderer
+import com.btcminer.android.ui.chart.dualScaleMaxLabelWidthDp
+import com.btcminer.android.ui.chart.formatDualScaleLabel
+import com.btcminer.android.ui.chart.mapMsAtMhzTick
+import com.btcminer.android.ui.digitalrain.DigitalRainPreferences
+import com.btcminer.android.ui.digitalrain.DigitalRainRenderBackend
+import com.btcminer.android.ui.digitalrain.DigitalRainSettingsRepository
+import com.btcminer.android.config.MiningConfigRepository
+import com.btcminer.android.databinding.ActivityMainBinding
+import com.btcminer.android.mining.DeviceTelemetryReader
+import com.btcminer.android.mining.hasFiniteTelemetryValues
+import com.btcminer.android.mining.HashRateDisplay
+import com.btcminer.android.mining.MiningConstraints
+import com.btcminer.android.mining.MiningForegroundService
+import com.btcminer.android.mining.BestDifficultyChartEvent
+import com.btcminer.android.mining.ChartSnapshot
+import com.btcminer.android.mining.MiningStatsRepository
+import com.btcminer.android.mining.MiningStatus
+import com.btcminer.android.mining.NativeMiner
+import com.btcminer.android.mining.StratumHeaderBuilder
+import com.btcminer.android.mining.StratumOutboundSubmitSource
+import com.github.mikephil.charting.data.Entry
+import com.github.mikephil.charting.data.LineData
+import com.github.mikephil.charting.data.LineDataSet
+import com.github.mikephil.charting.data.ScatterData
+import com.github.mikephil.charting.data.ScatterDataSet
+import com.github.mikephil.charting.data.PieData
+import com.github.mikephil.charting.data.PieDataSet
+import com.github.mikephil.charting.data.PieEntry
+import com.github.mikephil.charting.formatter.ValueFormatter
+import com.github.mikephil.charting.highlight.Highlight
+import com.github.mikephil.charting.listener.OnChartValueSelectedListener
+import com.github.mikephil.charting.listener.ChartTouchListener
+import com.github.mikephil.charting.listener.OnChartGestureListener
+import com.github.mikephil.charting.charts.PieChart
+import com.github.mikephil.charting.charts.LineChart
+import com.github.mikephil.charting.charts.ScatterChart
+import com.github.mikephil.charting.components.YAxis
+import com.github.mikephil.charting.components.Legend
+import com.github.mikephil.charting.components.LegendEntry
+import com.github.mikephil.charting.interfaces.datasets.ILineDataSet
+import com.btcminer.android.network.CertPins
+import com.btcminer.android.util.BitcoinAddressValidator
+import com.btcminer.android.util.FractalPlotKind
+import com.btcminer.android.util.MandelbrotEscapeRenderer
+import com.btcminer.android.util.NumberFormatUtils
+import com.btcminer.android.util.StratumJsonUiFormatter
+import com.google.android.material.snackbar.Snackbar
+import com.google.android.material.tabs.TabLayoutMediator
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.CertificatePinner
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONArray
+import java.math.BigDecimal
+import kotlin.math.ln
+import kotlin.math.log10
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import java.net.URLEncoder
+import java.util.ArrayDeque
+import java.util.LinkedHashSet
+import java.util.Locale
+import java.util.Scanner
+import java.util.concurrent.TimeUnit
+
+private data class MandelbrotRenderSnapshot(
+    val sdPrev: Double,
+    val sdNew: Double,
+    val sessionLnAnchor: Double,
+    val sessionLnPeak: Double,
+    val rollingLnMin: Double?,
+    val rollingLnMax: Double?,
+)
+
+private data class FractalBitmapCacheKey(
+    val snap: MandelbrotRenderSnapshot,
+    val bw: Int,
+    val bh: Int,
+    val plotKind: FractalPlotKind,
+)
+
+class MainActivity : AppCompatActivity() {
+
+    companion object {
+        /** Full cycle period (ms) for throttle flash (red/white). Low frequency for safety. */
+        private const val THROTTLE_FLASH_PERIOD_MS = 1000L
+        /** How often to fetch wallet balance from Mempool.space (ms). */
+        private const val MEMPOOL_BALANCE_FETCH_INTERVAL_MS = 3_600_000L  // 1 hour
+        private const val MEMPOOL_UTXO_URL = "https://mempool.space/api/address"
+        /** Delay before each Satoshi sequence starts. */
+        private const val SATOSHI_APPEAR_INTERVAL_MS = 3 * 60_000L
+        /** Time Satoshi image remains visible before post-flash/hide. */
+        private const val SATOSHI_VISIBLE_DURATION_MS = 60_000L
+        /** Single on/off step duration for the white lightning flash effect. */
+        private const val SATOSHI_FLASH_STEP_DURATION_MS = 90L
+        /** Number of white flashes in each burst (pre and post). */
+        private const val SATOSHI_FLASH_COUNT = 2
+        /** Time Satoshi lightning portrait variant stays visible after each flash burst (ms). */
+        private const val SATOSHI_LIGHTNING_PORTRAIT_MS = 300L //1_000L
+        /** Rolling window size for the short hash rate chart (matches prior ~2 min at 1 Hz). */
+        private const val HASHRATE_CHART_TWO_MIN_SAMPLES = 120
+        /** Rolling window size for the 10 min hash rate chart (10 min at 1 Hz). */
+        private const val HASHRATE_CHART_TEN_MIN_SAMPLES = 600
+        /** Reserve bottom space so hash rate legend is not clipped (fraction of chart height). */
+        private const val HASH_RATE_CHART_LEGEND_HEIGHT_FRACTION = 0.025f
+        private const val HASH_RATE_CHART_BASE_BOTTOM_EXTRA_DP = 2f
+        private const val HASH_RATE_CHART_LEGEND_Y_OFFSET_DP = 3f
+        private const val STATE_HASH_CHART_MODE = "hashChartMode"
+        private const val STATE_TELEMETRY_CHART_MODE = "telemetryChartMode"
+        private const val STATE_BEST_DIFF_CHART_X_MODE = "bestDiffChartXMode"
+
+        private const val BEST_DIFF_CHART_EPS_DIFF = 1e-18
+
+        private const val MANDEL_MAX_BITMAP_DIM = 512
+        private const val MANDEL_EPS_PREV = 1e-18
+        private const val MANDEL_ROLLING_LN_COUNT = 8
+    }
+
+    private enum class HashChartMode {
+        TwoMinute,
+        TenMinute,
+        Session,
+        ;
+
+        fun toggle(): HashChartMode = when (this) {
+            TwoMinute -> TenMinute
+            TenMinute -> Session
+            Session -> TwoMinute
+        }
+    }
+
+    private var hashChartMode = HashChartMode.TwoMinute
+
+    private enum class TelemetryChartMode {
+        TwoMinute,
+        TenMinute,
+        Session,
+        ;
+
+        fun toggle(): TelemetryChartMode = when (this) {
+            TwoMinute -> TenMinute
+            TenMinute -> Session
+            Session -> TwoMinute
+        }
+    }
+
+    private var telemetryChartMode = TelemetryChartMode.TwoMinute
+
+    private enum class BestDifficultyChartXMode {
+        HistoricalLinear,
+        SessionElapsedLinear,
+        ;
+
+        fun toggle(): BestDifficultyChartXMode = when (this) {
+            HistoricalLinear -> SessionElapsedLinear
+            SessionElapsedLinear -> HistoricalLinear
+        }
+    }
+
+    private var bestDifficultyChartXMode = BestDifficultyChartXMode.HistoricalLinear
+
+    private lateinit var binding: ActivityMainBinding
+    private lateinit var configRepository: MiningConfigRepository
+
+    private var dashboardOverlayVisible = true
+    /** Screen Y (raw) at bottom of header tap band; updated while overlay visible; -1 until first layout. */
+    private var dashboardHeaderTapBottomPx = -1
+
+    private val dashboardHeaderGlobalLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
+        updateDashboardHeaderTapBottomCached()
+    }
+    private val statsRepository by lazy { MiningStatsRepository(applicationContext) }
+
+    private var page1Fragment: DashboardStatsPage1Fragment? = null
+    private var page2Fragment: DashboardStatsPage2Fragment? = null
+    private var page3Fragment: DashboardStatsPage3Fragment? = null
+    private var page4Fragment: DashboardStatsPage4Fragment? = null
+    private var page5Fragment: DashboardStatsPage5Fragment? = null
+    private var dashboardTabMediator: TabLayoutMediator? = null
+    private var chartHashrateFragment: ChartHashrateFragment? = null
+    private var chartTelemetryFragment: ChartTelemetryFragment? = null
+    private var chartThermalFragment: ChartThermalFragment? = null
+    private var chartSharesDonutFragment: ChartSharesDonutFragment? = null
+    private var chartBestDifficultyFragment: ChartBestDifficultyFragment? = null
+    private var chartMandelbrotFragment: ChartMandelbrotFragment? = null
+    private var chartTabMediator: TabLayoutMediator? = null
+
+    private var mandelbrotRenderJob: Job? = null
+    private var fractalPrewarmJob: Job? = null
+    /** Session best difficulty already committed for Mandelbrot triggers (optimistic; avoids skipped steps under rapid improvements). */
+    private var mandelbrotLastRenderedSessionBest: Double = 0.0
+    private var mandelbrotSessionKey: Long? = null
+    /** [ln] of first session-best used for Mandelbrot this session; null until first improvement. */
+    private var mandelbrotSessionLnAnchor: Double? = null
+    private val mandelbrotRollingLnHighs = ArrayDeque<Double>(MANDEL_ROLLING_LN_COUNT)
+    /** Last fractal index rendered ([FractalPlotKind.entries]); -1 before first render this session. */
+    private var fractalPlotOrdinal: Int = -1
+    /** Latest difficulty snapshot for tap-to-rerender without a new session best. */
+    private var mandelbrotRenderSnapshot: MandelbrotRenderSnapshot? = null
+    private var mandelbrotDisplayedBitmap: Bitmap? = null
+    /** Matches [mandelbrotDisplayedBitmap]; used for caption after tab switch / rotation. */
+    private var lastRenderedFractalPlotKind: FractalPlotKind? = null
+    /** Reuse renders when cycling [FractalPlotKind] for the same [MandelbrotRenderSnapshot] and size. */
+    private val fractalBitmapCache = mutableMapOf<FractalBitmapCacheKey, Bitmap>()
+    /** Last session CPU/GPU identified counts passed to [updateSharesDonutChart]; null forces next refresh. */
+    private var lastDonutIdentifiedCounts: Pair<Long, Long>? = null
+    /** Keeps donut hole label aligned with [PieChart] layout; removed when donut fragment view is destroyed. */
+    private var donutChartLayoutListener: View.OnLayoutChangeListener? = null
+    private var donutChartForLayoutListener: PieChart? = null
+    private var lastThermalDisplayFahrenheit: Boolean? = null
+
+    private val dashboardFragmentCallbacks = object : FragmentManager.FragmentLifecycleCallbacks() {
+        override fun onFragmentViewCreated(fm: FragmentManager, f: Fragment, v: View, savedInstanceState: Bundle?) {
+            when (f) {
+                is DashboardStatsPage1Fragment -> page1Fragment = f
+                is DashboardStatsPage2Fragment -> page2Fragment = f
+                is DashboardStatsPage3Fragment -> page3Fragment = f
+                is DashboardStatsPage4Fragment -> page4Fragment = f
+                is DashboardStatsPage5Fragment -> page5Fragment = f
+                is ChartHashrateFragment -> {
+                    chartHashrateFragment = f
+                    setupChart()
+                }
+                is ChartTelemetryFragment -> {
+                    chartTelemetryFragment = f
+                    setupTelemetryChart()
+                }
+                is ChartThermalFragment -> {
+                    chartThermalFragment = f
+                    updateThermalChartUi()
+                }
+                is ChartSharesDonutFragment -> {
+                    chartSharesDonutFragment = f
+                    lastDonutIdentifiedCounts = null
+                    setupSharesDonutChart()
+                }
+                is ChartBestDifficultyFragment -> {
+                    chartBestDifficultyFragment = f
+                    setupBestDifficultyChart()
+                }
+                is ChartMandelbrotFragment -> {
+                    chartMandelbrotFragment = f
+                    setupMandelbrotView()
+                }
+                else -> return
+            }
+            refreshDashboardFromPoll()
+        }
+
+        override fun onFragmentViewDestroyed(fm: FragmentManager, f: Fragment) {
+            when (f) {
+                is DashboardStatsPage1Fragment -> if (page1Fragment === f) page1Fragment = null
+                is DashboardStatsPage2Fragment -> if (page2Fragment === f) page2Fragment = null
+                is DashboardStatsPage3Fragment -> if (page3Fragment === f) page3Fragment = null
+                is DashboardStatsPage4Fragment -> if (page4Fragment === f) page4Fragment = null
+                is DashboardStatsPage5Fragment -> if (page5Fragment === f) page5Fragment = null
+                is ChartHashrateFragment -> if (chartHashrateFragment === f) chartHashrateFragment = null
+                is ChartTelemetryFragment -> if (chartTelemetryFragment === f) chartTelemetryFragment = null
+                is ChartThermalFragment -> if (chartThermalFragment === f) chartThermalFragment = null
+                is ChartSharesDonutFragment -> if (chartSharesDonutFragment === f) {
+                    donutChartLayoutListener?.let { l ->
+                        donutChartForLayoutListener?.removeOnLayoutChangeListener(l)
+                    }
+                    donutChartLayoutListener = null
+                    donutChartForLayoutListener = null
+                    chartSharesDonutFragment = null
+                }
+                is ChartBestDifficultyFragment -> if (chartBestDifficultyFragment === f) chartBestDifficultyFragment = null
+                is ChartMandelbrotFragment -> if (chartMandelbrotFragment === f) chartMandelbrotFragment = null
+            }
+        }
+    }
+
+    /** Full-screen dimensions saved before entering PIP; used to scale root to fit in PIP. */
+    private var pipFullWidth = 0
+    private var pipFullHeight = 0
+    /** Listener that updates root scale when PIP window is resized; removed when leaving PIP. */
+    private var pipScaleLayoutListener: View.OnLayoutChangeListener? = null
+    /** True while [DigitalRainGlView.onPause] has been called and a matching onResume is still owed. */
+    private var glViewPaused = false
+
+    private val mempoolOkHttpClient: OkHttpClient by lazy {
+        val builder = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+        if (CertPins.hasMempoolSpacePins()) {
+            val pinnerBuilder = CertificatePinner.Builder()
+            CertPins.MEMPOOL_SPACE_PINS.forEach { pin -> pinnerBuilder.add("mempool.space", pin) }
+            builder.certificatePinner(pinnerBuilder.build())
+        }
+        builder.build()
+    }
+
+    private var miningService: MiningForegroundService? = null
+    private var gpuRetrySnackbar: Snackbar? = null
+    private val gpuRetryUiListener = object : MiningForegroundService.GpuRetryUiListener {
+        override fun onGpuRetry(attempt: Int) {
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+            if (gpuRetrySnackbar?.isShown == true) return
+            gpuRetrySnackbar = Snackbar.make(binding.root, R.string.gpu_retry_message, Snackbar.LENGTH_INDEFINITE)
+                .setAction(R.string.gpu_retry_dismiss) { gpuRetrySnackbar = null }
+            gpuRetrySnackbar?.show()
+        }
+
+        override fun onGpuResumed() {
+            gpuRetrySnackbar?.dismiss()
+            gpuRetrySnackbar = null
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+            Toast.makeText(this@MainActivity, R.string.gpu_mining_resumed, Toast.LENGTH_SHORT).show()
+        }
+    }
+    private var lastBitcoinAddress: String = ""
+    private val handler = Handler(Looper.getMainLooper())
+    private var satoshiNormalBackdropBitmap: Bitmap? = null
+    private var satoshiLightningBackdropBitmap: Bitmap? = null
+    private var satoshiUseLightningPortrait = false
+    private var satoshiLayerPortraitVisible = false
+    private var satoshiLayerFlashWhite = false
+    private var satoshiFlashStepsRemaining = 0
+    private var satoshiFlashVisiblePhase = true
+    private var satoshiFlashOnComplete: (() -> Unit)? = null
+    private var flashPhase = false
+    private val satoshiAfterLightningThenNormalRunnable = Runnable {
+        showSatoshiNormalPortrait()
+        handler.postDelayed(satoshiHideSequenceRunnable, SATOSHI_VISIBLE_DURATION_MS)
+    }
+    /** After post-hide lightning beat: hide portrait, white flash burst, then idle before next cycle. */
+    private val satoshiPostHideAfterLightningRunnable = Runnable {
+        hideSatoshiLayerContent()
+        startSatoshiFlashBurst {
+            handler.postDelayed(satoshiSequenceRunnable, SATOSHI_APPEAR_INTERVAL_MS)
+        }
+    }
+    private val satoshiSequenceRunnable: Runnable = Runnable {
+        startSatoshiFlashBurst {
+            showSatoshiLightningPortrait()
+            handler.postDelayed(satoshiAfterLightningThenNormalRunnable, SATOSHI_LIGHTNING_PORTRAIT_MS)
+        }
+    }
+    private val satoshiHideSequenceRunnable: Runnable = Runnable {
+        showSatoshiLightningPortrait()
+        handler.postDelayed(satoshiPostHideAfterLightningRunnable, SATOSHI_LIGHTNING_PORTRAIT_MS)
+    }
+    private val satoshiFlashRunnable = object : Runnable {
+        override fun run() {
+            if (satoshiFlashStepsRemaining <= 0) {
+                satoshiLayerFlashWhite = false
+                syncSatoshiBackdropToRain()
+                val onComplete = satoshiFlashOnComplete
+                satoshiFlashOnComplete = null
+                onComplete?.invoke()
+                return
+            }
+            satoshiLayerFlashWhite = satoshiFlashVisiblePhase
+            satoshiFlashVisiblePhase = !satoshiFlashVisiblePhase
+            satoshiFlashStepsRemaining--
+            syncSatoshiBackdropToRain()
+            handler.postDelayed(this, SATOSHI_FLASH_STEP_DURATION_MS)
+        }
+    }
+    private val flashRunnable = object : Runnable {
+        override fun run() {
+            val service = miningService
+            val hashrateThrottle = service?.isHashrateThrottleActive() == true
+            val batteryThrottle = service?.isBatteryThrottleActive() == true
+            val orange = ContextCompat.getColor(this@MainActivity, R.color.bitcoin_orange)
+            val throttleSecondary = ContextCompat.getColor(this@MainActivity, R.color.throttle_secondary)
+            val p1 = page1Fragment?.pageBinding
+            p1?.hashRateValue?.setTextColor(if (hashrateThrottle) if (flashPhase) Color.RED else throttleSecondary else orange)
+            p1?.batteryTempValue?.setTextColor(if (batteryThrottle) if (flashPhase) Color.RED else throttleSecondary else orange)
+            flashPhase = !flashPhase
+            handler.postDelayed(this, THROTTLE_FLASH_PERIOD_MS / 2)
+        }
+    }
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            refreshDashboardFromPoll()
+            handler.postDelayed(this, 1000L)
+        }
+    }
+
+    private val mempoolFetchRunnable: Runnable = object : Runnable {
+        override fun run() {
+            val self = this
+            val address = configRepository.getConfig().bitcoinAddress.trim()
+            if (address.isEmpty()) {
+                binding.walletBalanceValue.text = "—"
+                binding.walletBalanceNote.visibility = View.GONE
+                handler.postDelayed(self, MEMPOOL_BALANCE_FETCH_INTERVAL_MS)
+                return
+            }
+            if (!BitcoinAddressValidator.isValidAddress(address)) {
+                binding.walletBalanceValue.text = "—"
+                binding.walletBalanceNote.setText(R.string.wallet_balance_invalid_address)
+                binding.walletBalanceNote.visibility = View.VISIBLE
+                handler.postDelayed(self, MEMPOOL_BALANCE_FETCH_INTERVAL_MS)
+                return
+            }
+            Thread {
+                var result: String? = null
+                var certFailure = false
+                try {
+                    val encoded = URLEncoder.encode(address, "UTF-8")
+                    val url = "$MEMPOOL_UTXO_URL/$encoded/utxo"
+                    val request = Request.Builder().url(url).get().build()
+                    val response = mempoolOkHttpClient.newCall(request).execute()
+                    if (!response.isSuccessful) {
+                        result = "INVALID"
+                    } else {
+                        val text = response.body?.string() ?: ""
+                        val arr = JSONArray(text)
+                        var sumSat = 0L
+                        for (i in 0 until arr.length()) {
+                            val obj = arr.optJSONObject(i) ?: continue
+                            sumSat += obj.optLong("value", 0L)
+                        }
+                        val btc = sumSat / 100_000_000.0
+                        result = String.format(Locale.US, "₿ %.8f", btc)
+                    }
+                } catch (e: Exception) {
+                    result = "INVALID"
+                    certFailure = e is javax.net.ssl.SSLPeerUnverifiedException || e is javax.net.ssl.SSLException
+                }
+                val toShow = result
+                val showCertInvalid = certFailure
+                val showCertValidated = result != null && result != "INVALID" && CertPins.hasMempoolSpacePins()
+                runOnUiThread {
+                    if (CertPins.hasMempoolSpacePins()) {
+                        if (showCertValidated) Toast.makeText(this@MainActivity, R.string.mempool_cert_validated, Toast.LENGTH_SHORT).show()
+                        if (showCertInvalid) Toast.makeText(this@MainActivity, R.string.mempool_cert_invalid, Toast.LENGTH_SHORT).show()
+                    }
+                    binding.walletBalanceValue.text = toShow
+                    if (toShow == "INVALID") {
+                        binding.walletBalanceNote.setText(R.string.wallet_balance_tor_note)
+                        binding.walletBalanceNote.visibility = View.VISIBLE
+                    } else {
+                        binding.walletBalanceNote.visibility = View.GONE
+                    }
+                    handler.postDelayed(self, MEMPOOL_BALANCE_FETCH_INTERVAL_MS)
+                }
+            }.start()
+        }
+    }
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            miningService = (binder as? MiningForegroundService.LocalBinder)?.getService()
+            lastDonutIdentifiedCounts = null
+            if (DeviceTelemetryReader.getCachedUiState() == null) {
+                DeviceTelemetryReader.restorePersistedState(statsRepository.loadThermalChartState())
+            }
+            tryRestoreIdleFractalArt()
+            updateThermalChartUi()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            miningService = null
+            // Keep poll running so dashboard shows persisted counters and persisted chart snapshots.
+            handler.post {
+                updateStatsUi(statsRepository.get(), null)
+                updateLifetimeUi()
+                updateLifetimePanel2Ui()
+                refreshDashboardFromPoll()
+            }
+        }
+    }
+
+    private val requestNotificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ -> tryStartMiningService() }
+
+    private fun applyDigitalRainSettings() {
+        val settings = DigitalRainSettingsRepository(applicationContext).load()
+        binding.digitalRainView.applySettings(settings)
+        binding.digitalRainGlView.applySettings(settings)
+        syncRainBackdropBackend()
+        syncSatoshiBackdropToRain()
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            stopRainBackdrop()
+            if (isDigitalRainMasterEnabled()) {
+                startRainBackdrop()
+            }
+        }
+    }
+
+    private fun syncRainBackdropBackend() {
+        if (!isDigitalRainMasterEnabled()) {
+            binding.digitalRainView.visibility = View.GONE
+            binding.digitalRainGlView.visibility = View.GONE
+            return
+        }
+        val useGpu = DigitalRainPreferences(applicationContext).getRenderBackend() ==
+            DigitalRainRenderBackend.OPENGL_GPU
+        binding.digitalRainView.visibility = if (useGpu) View.GONE else View.VISIBLE
+        binding.digitalRainGlView.visibility = if (useGpu) View.VISIBLE else View.GONE
+    }
+
+    private fun startRainBackdrop() {
+        if (!isDigitalRainMasterEnabled()) {
+            stopRainBackdrop()
+            return
+        }
+        val useGpu = DigitalRainPreferences(applicationContext).getRenderBackend() ==
+            DigitalRainRenderBackend.OPENGL_GPU
+        if (useGpu) {
+            binding.digitalRainView.stopRain()
+            binding.digitalRainGlView.startRain()
+        } else {
+            binding.digitalRainGlView.stopRain()
+            binding.digitalRainView.startRain()
+        }
+    }
+
+    private fun stopRainBackdrop() {
+        binding.digitalRainView.stopRain()
+        binding.digitalRainGlView.stopRain()
+    }
+
+    private fun effectiveSatoshiBackdrop(): Bitmap? {
+        if (satoshiUseLightningPortrait) {
+            val lightning = satoshiLightningBackdropBitmap
+            if (lightning != null && !lightning.isRecycled) return lightning
+        }
+        val normal = satoshiNormalBackdropBitmap
+        return if (normal != null && !normal.isRecycled) normal else null
+    }
+
+    private fun syncSatoshiBackdropToRain() {
+        val bmp = effectiveSatoshiBackdrop()
+        binding.digitalRainView.setSatoshiBackdrop(
+            bmp,
+            satoshiLayerPortraitVisible,
+            satoshiLayerFlashWhite,
+        )
+        binding.digitalRainGlView.setSatoshiBackdrop(
+            bmp,
+            satoshiLayerPortraitVisible,
+            satoshiLayerFlashWhite,
+        )
+    }
+
+    private fun isDigitalRainMasterEnabled(): Boolean =
+        DigitalRainPreferences(applicationContext).isDigitalRainEnabled()
+
+    private fun updateDashboardHeaderTapBottomCached() {
+        if (!dashboardOverlayVisible || binding.dashboardOverlay.visibility != View.VISIBLE) return
+        val header = binding.dashboardHeaderRow
+        if (header.height <= 0) return
+        val loc = IntArray(2)
+        header.getLocationOnScreen(loc)
+        dashboardHeaderTapBottomPx = loc[1] + header.height
+    }
+
+    private fun headerTapBandBottomPx(): Int {
+        if (dashboardHeaderTapBottomPx >= 0) return dashboardHeaderTapBottomPx
+        val insetTop = ViewCompat.getRootWindowInsets(binding.root)
+            ?.getInsets(WindowInsetsCompat.Type.statusBars())?.top ?: 0
+        val overlayPadTop = binding.dashboardOverlay.paddingTop
+        val approxHeaderRowPx = (56f * resources.displayMetrics.density).toInt()
+        return insetTop + overlayPadTop + approxHeaderRowPx
+    }
+
+    /** UI-only: does not touch mining service or rain lifecycle. */
+    private fun toggleDashboardOverlayVisibility() {
+        dashboardOverlayVisible = !dashboardOverlayVisible
+        binding.dashboardOverlay.visibility = if (dashboardOverlayVisible) View.VISIBLE else View.GONE
+        if (dashboardOverlayVisible) {
+            binding.dashboardHeaderRow.post { updateDashboardHeaderTapBottomCached() }
+        }
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_UP && ev.rawY <= headerTapBandBottomPx().toFloat()) {
+            toggleDashboardOverlayVisibility()
+            return true
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun loadSatoshiLayerImage() {
+        satoshiNormalBackdropBitmap = runCatching {
+            assets.open("Satoshi_Nakamoto.png").use { input ->
+                BitmapFactory.decodeStream(input)
+            }
+        }.getOrNull()
+        satoshiLightningBackdropBitmap = runCatching {
+            assets.open("Satoshi_Nakamoto_lightning.png").use { input ->
+                BitmapFactory.decodeStream(input)
+            }
+        }.getOrNull()
+        satoshiUseLightningPortrait = false
+    }
+
+    private fun startSatoshiScheduler() {
+        stopSatoshiScheduler()
+        handler.postDelayed(satoshiSequenceRunnable, SATOSHI_APPEAR_INTERVAL_MS)
+    }
+
+    private fun stopSatoshiScheduler() {
+        handler.removeCallbacks(satoshiSequenceRunnable)
+        handler.removeCallbacks(satoshiHideSequenceRunnable)
+        handler.removeCallbacks(satoshiAfterLightningThenNormalRunnable)
+        handler.removeCallbacks(satoshiPostHideAfterLightningRunnable)
+        handler.removeCallbacks(satoshiFlashRunnable)
+        satoshiFlashOnComplete = null
+        satoshiFlashStepsRemaining = 0
+        satoshiFlashVisiblePhase = true
+        hideSatoshiLayerContent()
+    }
+
+    private fun startSatoshiFlashBurst(onComplete: () -> Unit) {
+        handler.removeCallbacks(satoshiFlashRunnable)
+        satoshiFlashOnComplete = onComplete
+        satoshiFlashStepsRemaining = SATOSHI_FLASH_COUNT * 2
+        satoshiFlashVisiblePhase = true
+        handler.post(satoshiFlashRunnable)
+    }
+
+    private fun showSatoshiNormalPortrait() {
+        satoshiLayerPortraitVisible = true
+        satoshiUseLightningPortrait = false
+        syncSatoshiBackdropToRain()
+    }
+
+    private fun showSatoshiLightningPortrait() {
+        satoshiLayerPortraitVisible = true
+        satoshiUseLightningPortrait = true
+        syncSatoshiBackdropToRain()
+    }
+
+    private fun hideSatoshiLayerContent() {
+        satoshiLayerPortraitVisible = false
+        satoshiLayerFlashWhite = false
+        satoshiUseLightningPortrait = false
+        syncSatoshiBackdropToRain()
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+        loadSatoshiLayerImage()
+        hideSatoshiLayerContent()
+        savedInstanceState?.getString(STATE_HASH_CHART_MODE)?.let { saved ->
+            hashChartMode = runCatching { HashChartMode.valueOf(saved) }.getOrDefault(HashChartMode.TwoMinute)
+        }
+        savedInstanceState?.getString(STATE_TELEMETRY_CHART_MODE)?.let { saved ->
+            telemetryChartMode = runCatching { TelemetryChartMode.valueOf(saved) }
+                .getOrDefault(TelemetryChartMode.TwoMinute)
+        }
+        savedInstanceState?.getString(STATE_BEST_DIFF_CHART_X_MODE)?.let { saved ->
+            bestDifficultyChartXMode = when (saved) {
+                "LifetimeRelativeLog" -> BestDifficultyChartXMode.HistoricalLinear
+                else -> runCatching { BestDifficultyChartXMode.valueOf(saved) }
+                    .getOrDefault(BestDifficultyChartXMode.HistoricalLinear)
+            }
+        }
+        configRepository = MiningConfigRepository(applicationContext)
+        DeviceTelemetryReader.restorePersistedState(statsRepository.loadThermalChartState())
+
+        // Phase 1: verify native miner loads and responds
+        Toast.makeText(this, "Native miner: ${NativeMiner.nativeVersion()}", Toast.LENGTH_SHORT).show()
+        // Validate: SHA-256 implementation
+        val phase2Ok = NativeMiner.nativeTestSha256()
+        Toast.makeText(
+            this,
+            if (phase2Ok) "Validate: SHA-256 OK" else "Validate: SHA-256 FAIL",
+            Toast.LENGTH_SHORT
+        ).show()
+
+        binding.buttonConfig.setOnClickListener {
+            startActivity(Intent(this, ConfigHubActivity::class.java))
+        }
+        binding.buttonStartMining.setOnClickListener { onStartMiningClicked() }
+        binding.buttonStopMining.setOnClickListener { onStopMiningClicked() }
+
+        supportFragmentManager.registerFragmentLifecycleCallbacks(dashboardFragmentCallbacks, true)
+        binding.dashboardPager.adapter = MainPagerAdapter(this)
+        val dashboardPageCount = binding.dashboardPager.adapter!!.itemCount
+        dashboardTabMediator = TabLayoutMediator(
+            binding.dashboardPageIndicator,
+            binding.dashboardPager,
+        ) { tab, position ->
+            tab.text = ""
+            tab.contentDescription = getString(
+                R.string.dashboard_page_indicator_a11y,
+                position + 1,
+                dashboardPageCount,
+            )
+        }.also { it.attach() }
+        binding.chartPager.adapter = ChartPagerAdapter(this)
+        val chartPageCount = binding.chartPager.adapter!!.itemCount
+        chartTabMediator = TabLayoutMediator(
+            binding.chartPageIndicator,
+            binding.chartPager,
+        ) { tab, position ->
+            tab.text = ""
+            tab.contentDescription = getString(
+                R.string.chart_page_indicator_a11y,
+                position + 1,
+                chartPageCount,
+            )
+        }.also { it.attach() }
+        binding.chartPager.setCurrentItem(0, false)
+
+        binding.digitalRainGlView.onGpuInitFailedListener = {
+            DigitalRainPreferences(this).setRenderBackend(DigitalRainRenderBackend.CANVAS_CPU)
+            syncRainBackdropBackend()
+            stopRainBackdrop()
+            startRainBackdrop()
+            Toast.makeText(this, R.string.digital_rain_gpu_fallback, Toast.LENGTH_LONG).show()
+        }
+
+        applyDigitalRainSettings()
+
+        binding.dashboardHeaderRow.viewTreeObserver.addOnGlobalLayoutListener(dashboardHeaderGlobalLayoutListener)
+
+        // Initialize lastBitcoinAddress to detect changes when returning from Config
+        lastBitcoinAddress = configRepository.getConfig().bitcoinAddress.trim()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_HASH_CHART_MODE, hashChartMode.name)
+        outState.putString(STATE_TELEMETRY_CHART_MODE, telemetryChartMode.name)
+        outState.putString(STATE_BEST_DIFF_CHART_X_MODE, bestDifficultyChartXMode.name)
+    }
+
+    override fun onDestroy() {
+        recycleAllFractalBitmapMemory()
+        lastRenderedFractalPlotKind = null
+        mandelbrotRenderSnapshot = null
+        dashboardTabMediator?.detach()
+        dashboardTabMediator = null
+        chartTabMediator?.detach()
+        chartTabMediator = null
+        supportFragmentManager.unregisterFragmentLifecycleCallbacks(dashboardFragmentCallbacks)
+        binding.dashboardHeaderRow.viewTreeObserver.removeOnGlobalLayoutListener(dashboardHeaderGlobalLayoutListener)
+        super.onDestroy()
+    }
+
+    override fun onPause() {
+        if (!isInPictureInPictureMode) {
+            binding.digitalRainGlView.onPause()
+            glViewPaused = true
+        }
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (glViewPaused) {
+            binding.digitalRainGlView.onResume()
+            glViewPaused = false
+        }
+        applyDigitalRainSettings()
+        val useF = configRepository.getConfig().batteryTempFahrenheit
+        if (lastThermalDisplayFahrenheit != null && lastThermalDisplayFahrenheit != useF) {
+            updateThermalChartUi()
+            refreshTelemetryChartFromCurrentSource()
+        }
+        // Check if Bitcoin address changed in Config and trigger immediate fetch
+        val currentAddress = configRepository.getConfig().bitcoinAddress.trim()
+        if (currentAddress != lastBitcoinAddress) {
+            lastBitcoinAddress = currentAddress
+            // Trigger immediate balance check when address changes
+            handler.post(mempoolFetchRunnable)
+        }
+        // One-time overheat banner: if mining was stopped due to overheat, show until user dismisses
+        val prefs = getSharedPreferences(MiningForegroundService.OVERHEAT_BANNER_PREFS, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(MiningForegroundService.KEY_SHOW_OVERHEAT_BANNER, false)) {
+            Snackbar.make(binding.root, getString(R.string.overheat_banner_message), Snackbar.LENGTH_INDEFINITE)
+                .setAction(R.string.overheat_banner_dismiss) {
+                    prefs.edit().putBoolean(MiningForegroundService.KEY_SHOW_OVERHEAT_BANNER, false).apply()
+                }
+                .show()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        startRainBackdrop()
+        startSatoshiScheduler()
+        handler.post(pollRunnable)
+        handler.post(flashRunnable)
+        handler.post(mempoolFetchRunnable)
+        MiningForegroundService.gpuRetryUiListener = gpuRetryUiListener
+        if (statsRepository.isMiningRequested()) {
+            MiningForegroundService.startAsForeground(this, MiningForegroundService.ACTION_RESUME)
+        }
+        bindService(
+            Intent(this, MiningForegroundService::class.java),
+            connection,
+            Context.BIND_AUTO_CREATE
+        )
+    }
+
+    override fun onStop() {
+        super.onStop()
+        stopRainBackdrop()
+        if (!glViewPaused) {
+            binding.digitalRainGlView.onPause()
+            glViewPaused = true
+        }
+        stopSatoshiScheduler()
+        if (MiningForegroundService.gpuRetryUiListener === gpuRetryUiListener) {
+            MiningForegroundService.gpuRetryUiListener = null
+        }
+        gpuRetrySnackbar?.dismiss()
+        gpuRetrySnackbar = null
+        try {
+            unbindService(connection)
+        } catch (_: Exception) { }
+        miningService = null
+        handler.removeCallbacks(pollRunnable)
+        handler.removeCallbacks(flashRunnable)
+        handler.removeCallbacks(mempoolFetchRunnable)
+        val orange = ContextCompat.getColor(this, R.color.bitcoin_orange)
+        page1Fragment?.pageBinding?.hashRateValue?.setTextColor(orange)
+        page1Fragment?.pageBinding?.batteryTempValue?.setTextColor(orange)
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            enterPictureInPictureModeIfSupported()
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val root = binding.root
+        if (isInPictureInPictureMode) {
+            // Keep root at full size and scale it down so entire screen fits in PIP (no reflow/crop).
+            if (pipFullWidth > 0 && pipFullHeight > 0) {
+                root.layoutParams = (root.layoutParams as? FrameLayout.LayoutParams)?.apply {
+                    width = pipFullWidth
+                    height = pipFullHeight
+                } ?: FrameLayout.LayoutParams(pipFullWidth, pipFullHeight)
+                pipScaleLayoutListener?.let { (root.parent as? View)?.removeOnLayoutChangeListener(it) }
+                pipScaleLayoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                    updatePipScale()
+                }
+                (root.parent as? View)?.addOnLayoutChangeListener(pipScaleLayoutListener)
+                root.post { updatePipScale() }
+            }
+        } else {
+            pipScaleLayoutListener?.let { (root.parent as? View)?.removeOnLayoutChangeListener(it) }
+            pipScaleLayoutListener = null
+            // Restore normal layout and scale when leaving PIP.
+            root.layoutParams = (root.layoutParams as? FrameLayout.LayoutParams)?.apply {
+                width = ViewGroup.LayoutParams.MATCH_PARENT
+                height = ViewGroup.LayoutParams.MATCH_PARENT
+            } ?: FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            root.scaleX = 1f
+            root.scaleY = 1f
+            root.requestLayout()
+        }
+    }
+
+    /** Recompute root scale so full content fits the current PIP window size. */
+    private fun updatePipScale() {
+        if (pipFullWidth <= 0 || pipFullHeight <= 0) return
+        val root = binding.root
+        val parent = root.parent as? View ?: return
+        val pw = parent.width
+        val ph = parent.height
+        if (pw > 0 && ph > 0) {
+            val scale = minOf(pw.toFloat() / pipFullWidth, ph.toFloat() / pipFullHeight)
+            root.pivotX = 0f
+            root.pivotY = 0f
+            root.scaleX = scale
+            root.scaleY = scale
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun enterPictureInPictureModeIfSupported() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val root = binding.root
+        val w = root.width
+        val h = root.height
+        val dm = resources.displayMetrics
+        val width = if (w > 0 && h > 0) w else dm.widthPixels
+        val height = if (w > 0 && h > 0) h else dm.heightPixels
+        if (w > 0 && h > 0) {
+            pipFullWidth = w
+            pipFullHeight = h
+        }
+        // Portrait: height >= width. Ensure portrait Rational so PIP window is always tall.
+        val portraitW = minOf(width, height)
+        val portraitH = maxOf(width, height)
+        val rational = Rational(portraitW, portraitH)
+        // Source rect in window coordinates.
+        val sourceRect = if (w > 0 && h > 0) {
+            val loc = IntArray(2)
+            root.getLocationInWindow(loc)
+            Rect(loc[0], loc[1], loc[0] + w, loc[1] + h)
+        } else {
+            Rect(0, 0, dm.widthPixels, dm.heightPixels)
+        }
+        val builder = PictureInPictureParams.Builder()
+            .setAspectRatio(rational)
+            .setSourceRectHint(sourceRect)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setSeamlessResizeEnabled(false)
+        }
+        if (!enterPictureInPictureMode(builder.build())) {
+            // PIP not entered (e.g. not allowed by device or policy)
+        }
+    }
+
+    private fun setupChart() {
+        val chartBinding = chartHashrateFragment?.chartBinding ?: return
+        val chart = chartBinding.hashRateChart
+        val chartTextColor = ContextCompat.getColor(this, R.color.chart_axis_legend)
+        chart.description.isEnabled = false
+        chart.legend.isEnabled = false
+        chart.legend.setTextColor(chartTextColor)
+        chart.xAxis.setDrawLabels(true)
+        chart.xAxis.setTextColor(chartTextColor)
+        chart.xAxis.labelRotationAngle = -45f
+        chart.axisLeft.setDrawLabels(true)
+        chart.axisLeft.setTextColor(chartTextColor)
+        chart.axisRight.isEnabled = true
+        chart.axisRight.setDrawLabels(true)
+        chart.axisRight.setTextColor(chartTextColor)
+        chart.axisRight.valueFormatter = object : ValueFormatter() {
+            override fun getFormattedValue(value: Float): String {
+                val useF = configRepository.getConfig().batteryTempFahrenheit
+                val displayValue = if (useF) (value * 9f / 5f + 32f) else value
+                val unit = if (useF) "F" else "C"
+                return String.format(Locale.US, "%.1f%s", displayValue, unit)
+            }
+        }
+        chart.setTouchEnabled(true)
+        chart.isDragEnabled = false
+        chart.setScaleEnabled(false)
+        chart.setPinchZoom(false)
+        chart.isHighlightPerTapEnabled = false
+        chart.isHighlightPerDragEnabled = false
+        chart.setMinOffset(8f)
+        applyHashRateChartOffsets(chart)
+        applyTelemetryChartLegend(chart, chartTextColor, legendYOffset = HASH_RATE_CHART_LEGEND_Y_OFFSET_DP)
+        if (chart.height <= 0) {
+            chart.post {
+                applyHashRateChartOffsets(chart)
+                chart.invalidate()
+            }
+        }
+        chart.setOnChartGestureListener(object : OnChartGestureListener {
+            override fun onChartGestureStart(me: MotionEvent?, lastPerformedGesture: ChartTouchListener.ChartGesture?) {}
+            override fun onChartGestureEnd(me: MotionEvent?, lastPerformedGesture: ChartTouchListener.ChartGesture?) {}
+            override fun onChartLongPressed(me: MotionEvent?) {}
+            override fun onChartDoubleTapped(me: MotionEvent?) {}
+            override fun onChartSingleTapped(me: MotionEvent?) {
+                hashChartMode = hashChartMode.toggle()
+                refreshDashboardFromPoll()
+            }
+
+            override fun onChartFling(me1: MotionEvent?, me2: MotionEvent?, velocityX: Float, velocityY: Float) {}
+            override fun onChartScale(me: MotionEvent?, scaleX: Float, scaleY: Float) {}
+            override fun onChartTranslate(me: MotionEvent?, dX: Float, dY: Float) {}
+        })
+        chart.contentDescription = getString(R.string.hash_chart_a11y_toggle_hint)
+    }
+
+    private fun setupTelemetryChart() {
+        val chartBinding = chartTelemetryFragment?.chartBinding ?: return
+        val chart = chartBinding.telemetryChart
+        val chartTextColor = ContextCompat.getColor(this, R.color.chart_axis_legend)
+        chart.description.isEnabled = false
+        chart.legend.isEnabled = false
+        chart.legend.setTextColor(chartTextColor)
+        chart.xAxis.setDrawLabels(true)
+        chart.xAxis.setTextColor(chartTextColor)
+        chart.xAxis.labelRotationAngle = -45f
+        chart.axisLeft.setDrawLabels(true)
+        chart.axisLeft.setTextColor(chartTextColor)
+        chart.axisLeft.valueFormatter = object : ValueFormatter() {
+            override fun getFormattedValue(value: Float): String =
+                String.format(Locale.US, "%.0f Mhz", value)
+        }
+        chart.setRendererLeftYAxis(
+            TelemetryLeftYAxisRenderer(
+                chart.viewPortHandler,
+                chart.axisLeft,
+                chart.getTransformer(YAxis.AxisDependency.LEFT),
+            ),
+        )
+        chart.axisRight.isEnabled = true
+        chart.axisRight.setDrawLabels(true)
+        chart.axisRight.setTextColor(chartTextColor)
+        chart.axisRight.valueFormatter = object : ValueFormatter() {
+            override fun getFormattedValue(value: Float): String {
+                val useF = configRepository.getConfig().batteryTempFahrenheit
+                val displayValue = if (useF) (value * 9f / 5f + 32f) else value
+                val unit = if (useF) "F" else "C"
+                return String.format(Locale.US, "%.1f%s", displayValue, unit)
+            }
+        }
+        chart.setTouchEnabled(true)
+        chart.isDragEnabled = false
+        chart.setScaleEnabled(false)
+        chart.setPinchZoom(false)
+        chart.isHighlightPerTapEnabled = false
+        chart.isHighlightPerDragEnabled = false
+        chart.setMinOffset(8f)
+        applyTelemetryChartOffsets(chart, dualScaleLeft = false)
+        applyTelemetryChartLegend(chart, chartTextColor)
+        chart.setOnChartGestureListener(object : OnChartGestureListener {
+            override fun onChartGestureStart(me: MotionEvent?, lastPerformedGesture: ChartTouchListener.ChartGesture?) {}
+            override fun onChartGestureEnd(me: MotionEvent?, lastPerformedGesture: ChartTouchListener.ChartGesture?) {}
+            override fun onChartLongPressed(me: MotionEvent?) {}
+            override fun onChartDoubleTapped(me: MotionEvent?) {}
+            override fun onChartSingleTapped(me: MotionEvent?) {
+                telemetryChartMode = telemetryChartMode.toggle()
+                refreshDashboardFromPoll()
+            }
+
+            override fun onChartFling(me1: MotionEvent?, me2: MotionEvent?, velocityX: Float, velocityY: Float) {}
+            override fun onChartScale(me: MotionEvent?, scaleX: Float, scaleY: Float) {}
+            override fun onChartTranslate(me: MotionEvent?, dX: Float, dY: Float) {}
+        })
+        chart.contentDescription = getString(R.string.telemetry_chart_a11y_toggle_hint)
+    }
+
+    private fun applyTelemetryChartOffsets(chart: LineChart, dualScaleLeft: Boolean) {
+        chart.setExtraOffsets(
+            if (dualScaleLeft) 14f else 12f,
+            8f,
+            8f,
+            4f,
+        )
+    }
+
+    private fun hashRateChartBottomExtraOffset(chart: LineChart): Float {
+        val heightDp = chart.height / resources.displayMetrics.density
+        val legendReserveDp = if (heightDp > 0f) {
+            heightDp * HASH_RATE_CHART_LEGEND_HEIGHT_FRACTION
+        } else {
+            5f
+        }
+        return HASH_RATE_CHART_BASE_BOTTOM_EXTRA_DP + legendReserveDp
+    }
+
+    private fun applyHashRateChartOffsets(chart: LineChart) {
+        chart.setExtraOffsets(
+            12f,
+            8f,
+            8f,
+            hashRateChartBottomExtraOffset(chart),
+        )
+    }
+
+    private fun telemetryLegendMaxSizePercent(chart: LineChart, entryCount: Int): Float {
+        if (entryCount <= 0) return 0.85f
+        val contentWidth = chart.viewPortHandler.contentWidth().coerceAtLeast(1f)
+        val entriesPerRow = (entryCount + 1) / 2
+        val density = resources.displayMetrics.density
+        val labelWidthDp = 6f + 4f + 8f * 0.55f * 7f
+        val neededWidthPx = entriesPerRow * labelWidthDp * density
+        return (neededWidthPx / contentWidth).coerceIn(0.78f, 0.95f)
+    }
+
+    private fun applyTelemetryChartLegend(
+        chart: LineChart,
+        chartTextColor: Int,
+        entryCount: Int = 0,
+        allowLayoutRetry: Boolean = true,
+        legendYOffset: Float = 0f,
+    ) {
+        chart.legend.verticalAlignment = Legend.LegendVerticalAlignment.BOTTOM
+        chart.legend.horizontalAlignment = Legend.LegendHorizontalAlignment.LEFT
+        chart.legend.orientation = Legend.LegendOrientation.HORIZONTAL
+        chart.legend.isWordWrapEnabled = true
+        chart.legend.textSize = 8f
+        chart.legend.formSize = 6f
+        chart.legend.yEntrySpace = 2f
+        chart.legend.xEntrySpace = 4f
+        chart.legend.yOffset = legendYOffset
+        chart.legend.form = Legend.LegendForm.SQUARE
+        chart.legend.setDrawInside(false)
+        chart.legend.setTextColor(chartTextColor)
+
+        val contentWidth = chart.viewPortHandler.contentWidth()
+        chart.legend.maxSizePercent = if (entryCount > 0 && contentWidth > 1f) {
+            telemetryLegendMaxSizePercent(chart, entryCount)
+        } else {
+            0.85f
+        }
+
+        if (allowLayoutRetry && entryCount > 0 && contentWidth <= 1f) {
+            chart.post {
+                applyTelemetryChartLegend(
+                    chart,
+                    chartTextColor,
+                    entryCount,
+                    allowLayoutRetry = false,
+                    legendYOffset = legendYOffset,
+                )
+                chart.invalidate()
+            }
+        }
+    }
+
+    private fun setupSharesDonutChart() {
+        val b = chartSharesDonutFragment?.chartBinding ?: return
+        val chart = b.sharesDonutChart
+        val chartTextColor = ContextCompat.getColor(this, R.color.chart_axis_legend)
+        chart.description.isEnabled = false
+        chart.isDrawHoleEnabled = true
+        chart.holeRadius = 62f
+        chart.transparentCircleRadius = 66f
+        chart.setUsePercentValues(false)
+        chart.setDrawEntryLabels(false)
+        chart.setHoleColor(Color.TRANSPARENT)
+        chart.centerText = ""
+        chart.legend.isEnabled = true
+        chart.legend.textColor = chartTextColor
+        chart.legend.verticalAlignment = Legend.LegendVerticalAlignment.BOTTOM
+        chart.legend.horizontalAlignment = Legend.LegendHorizontalAlignment.CENTER
+        chart.legend.orientation = Legend.LegendOrientation.HORIZONTAL
+        chart.legend.setDrawInside(false)
+        chart.legend.form = Legend.LegendForm.SQUARE
+        chart.legend.xEntrySpace = 8f
+        chart.legend.yEntrySpace = 0f
+        chart.setExtraOffsets(20f, 18f, 20f, 18f)
+        chart.isHighlightPerTapEnabled = true
+        chart.isRotationEnabled = false
+        chart.marker = null
+        val forwardTouch = View.OnTouchListener { _, ev ->
+            SharesDonutRimLabelHelper.forwardTouchToPieChart(chart, b.donutRimLabelsOverlay, ev)
+        }
+        b.donutRimLabelsOverlay.setOnTouchListener(forwardTouch)
+        b.donutRimCpuPct.setOnTouchListener(forwardTouch)
+        b.donutRimGpuPct.setOnTouchListener(forwardTouch)
+        chart.setOnChartValueSelectedListener(object : OnChartValueSelectedListener {
+            override fun onValueSelected(e: Entry?, h: Highlight?) {
+                syncDonutRimLabels()
+            }
+
+            override fun onNothingSelected() {
+                chartSharesDonutFragment?.chartBinding?.let { bb ->
+                    SharesDonutRimLabelHelper.hide(bb.donutRimLabelsOverlay, bb.donutRimCpuPct, bb.donutRimGpuPct)
+                }
+            }
+        })
+        donutChartLayoutListener?.let { l ->
+            donutChartForLayoutListener?.removeOnLayoutChangeListener(l)
+        }
+        donutChartForLayoutListener = chart
+        val centerLabel = b.donutCenterValue
+        donutChartLayoutListener = View.OnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            if (v is PieChart && v.width > 0 && v.height > 0) {
+                SharesDonutCenterLabelHelper.updateLayout(v, centerLabel)
+            }
+        }
+        chart.addOnLayoutChangeListener(donutChartLayoutListener)
+        chart.post {
+            SharesDonutCenterLabelHelper.updateLayout(chart, centerLabel)
+        }
+    }
+
+    private fun setupBestDifficultyChart() {
+        val cb = chartBestDifficultyFragment?.chartBinding ?: return
+        val chart = cb.bestDifficultyChart
+        val chartTextColor = ContextCompat.getColor(this, R.color.chart_axis_legend)
+        chart.description.isEnabled = false
+        chart.legend.isEnabled = true
+        chart.legend.textColor = chartTextColor
+        chart.legend.verticalAlignment = Legend.LegendVerticalAlignment.TOP
+        chart.legend.horizontalAlignment = Legend.LegendHorizontalAlignment.RIGHT
+        chart.legend.orientation = Legend.LegendOrientation.VERTICAL
+        chart.legend.setDrawInside(false)
+        chart.legend.form = Legend.LegendForm.CIRCLE
+        chart.xAxis.setDrawGridLines(true)
+        chart.xAxis.textColor = chartTextColor
+        chart.axisLeft.setDrawGridLines(true)
+        chart.axisLeft.textColor = chartTextColor
+        chart.axisRight.isEnabled = false
+        chart.setTouchEnabled(true)
+        chart.isDragEnabled = false
+        chart.setScaleEnabled(false)
+        chart.setPinchZoom(false)
+        chart.isHighlightPerTapEnabled = false
+        chart.isHighlightPerDragEnabled = false
+        chart.xAxis.labelRotationAngle = -45f
+        chart.setExtraOffsets(8f, 8f, 24f, 8f)
+        chart.setOnChartGestureListener(null)
+        val tapHint = getString(R.string.best_difficulty_chart_a11y_toggle_hint)
+        chart.contentDescription = tapHint
+        cb.bestDifficultyChartTapOverlay.contentDescription = tapHint
+        cb.bestDifficultyChartTapOverlay.setOnClickListener { toggleBestDifficultyChartMode() }
+        refreshBestDifficultyChart()
+    }
+
+    private fun fractalBitmapCacheKey(snap: MandelbrotRenderSnapshot, bw: Int, bh: Int, plotKind: FractalPlotKind) =
+        FractalBitmapCacheKey(snap, bw, bh, plotKind)
+
+    private fun isBitmapRetainedInFractalCache(bmp: Bitmap?): Boolean {
+        if (bmp == null) return false
+        return fractalBitmapCache.values.any { it === bmp }
+    }
+
+    private fun recycleAllFractalBitmapMemory() {
+        fractalPrewarmJob?.cancel()
+        fractalPrewarmJob = null
+        mandelbrotRenderJob?.cancel()
+        mandelbrotRenderJob = null
+        val unique = LinkedHashSet<Bitmap>()
+        fractalBitmapCache.values.forEach { unique.add(it) }
+        mandelbrotDisplayedBitmap?.let { unique.add(it) }
+        unique.forEach { if (!it.isRecycled) it.recycle() }
+        fractalBitmapCache.clear()
+        mandelbrotDisplayedBitmap = null
+    }
+
+    /** New session-best render: drop cached types for the old snapshot; keep current frame until the new render completes. */
+    private fun invalidateFractalBitmapCacheForSnapshotChange() {
+        fractalPrewarmJob?.cancel()
+        fractalPrewarmJob = null
+        val keep = mandelbrotDisplayedBitmap
+        fractalBitmapCache.values.forEach { bmp ->
+            if (bmp !== keep && !bmp.isRecycled) bmp.recycle()
+        }
+        fractalBitmapCache.clear()
+    }
+
+    private fun applyFractalBitmapToUi(bmp: Bitmap, plotKind: FractalPlotKind) {
+        val prev = mandelbrotDisplayedBitmap
+        chartMandelbrotFragment?.chartBinding?.let { b ->
+            b.mandelbrotImage.setImageBitmap(bmp)
+            b.mandelbrotPlaceholder.visibility = View.GONE
+            b.mandelbrotImage.contentDescription = getString(
+                R.string.fractal_chart_image_a11y_with_kind,
+                fractalDisplayName(plotKind),
+            )
+            updateFractalChartCaption(plotKind)
+        }
+        mandelbrotDisplayedBitmap = bmp
+        lastRenderedFractalPlotKind = plotKind
+        if (prev != null && prev !== bmp && !isBitmapRetainedInFractalCache(prev)) {
+            prev.recycle()
+        }
+        persistFractalChartStateIfApplicable()
+    }
+
+    private fun persistFractalChartStateIfApplicable() {
+        val snap = mandelbrotRenderSnapshot ?: return
+        val kind = lastRenderedFractalPlotKind ?: return
+        statsRepository.saveFractalChartState(
+            sdPrev = snap.sdPrev,
+            sdNew = snap.sdNew,
+            sessionLnAnchor = snap.sessionLnAnchor,
+            sessionLnPeak = snap.sessionLnPeak,
+            rollingLnMin = snap.rollingLnMin,
+            rollingLnMax = snap.rollingLnMax,
+            fractalPlotOrdinal = fractalPlotOrdinal,
+            lastPlotKindOrdinal = kind.ordinal,
+        )
+    }
+
+    /** Clears fractal bitmaps and Mandelbrot session fields; used when starting mining and when service session changes. */
+    private fun purgeFractalStateForNewMiningSession() {
+        statsRepository.clearFractalChartState()
+        statsRepository.clearThermalChartState()
+        DeviceTelemetryReader.resetForSession()
+        updateThermalChartUi()
+        recycleAllFractalBitmapMemory()
+        mandelbrotSessionKey = null
+        mandelbrotLastRenderedSessionBest = 0.0
+        mandelbrotSessionLnAnchor = null
+        mandelbrotRollingLnHighs.clear()
+        fractalPlotOrdinal = -1
+        mandelbrotRenderSnapshot = null
+        lastRenderedFractalPlotKind = null
+        updateFractalChartCaption(null)
+        setupMandelbrotView()
+    }
+
+    private fun setupMandelbrotView() {
+        val bb = chartMandelbrotFragment?.chartBinding ?: return
+        bb.mandelbrotCaption.setTextColor(ContextCompat.getColor(this, R.color.chart_axis_legend))
+        bb.mandelbrotImage.isClickable = true
+        bb.mandelbrotImage.setOnClickListener { cycleFractalPlotAndRender() }
+        val bmp = mandelbrotDisplayedBitmap
+        if (bmp != null && !bmp.isRecycled) {
+            bb.mandelbrotImage.setImageBitmap(bmp)
+            bb.mandelbrotPlaceholder.visibility = View.GONE
+        } else {
+            bb.mandelbrotImage.setImageDrawable(null)
+            bb.mandelbrotPlaceholder.visibility = View.VISIBLE
+        }
+        lastRenderedFractalPlotKind?.let { kind ->
+            bb.mandelbrotImage.contentDescription = getString(R.string.fractal_chart_image_a11y_with_kind, fractalDisplayName(kind))
+        } ?: run {
+            bb.mandelbrotImage.contentDescription = getString(R.string.mandelbrot_chart_image_a11y)
+        }
+        updateFractalChartCaption(lastRenderedFractalPlotKind)
+        chartMandelbrotFragment?.view?.post { tryRestoreIdleFractalArt() }
+    }
+
+    /** Loads persisted fractal snapshot when idle and re-renders (deterministic); skips if mining or memory already holds art. */
+    private fun tryRestoreIdleFractalArt() {
+        val svc = miningService ?: return
+        if (svc.getStatus().state == MiningStatus.State.Mining) return
+        if (mandelbrotRenderSnapshot != null) return
+        val shown = mandelbrotDisplayedBitmap
+        if (shown != null && !shown.isRecycled) return
+
+        val container = chartMandelbrotFragment?.view ?: return
+        val vw = container.width
+        val vh = container.height
+        if (vw <= 0 || vh <= 0) {
+            container.post { tryRestoreIdleFractalArt() }
+            return
+        }
+
+        val loaded = statsRepository.loadFractalChartState() ?: return
+        val snap = MandelbrotRenderSnapshot(
+            loaded.sdPrev,
+            loaded.sdNew,
+            loaded.sessionLnAnchor,
+            loaded.sessionLnPeak,
+            loaded.rollingLnMin,
+            loaded.rollingLnMax,
+        )
+        mandelbrotRenderSnapshot = snap
+        fractalPlotOrdinal = loaded.fractalPlotOrdinal
+        mandelbrotLastRenderedSessionBest = snap.sdNew
+        mandelbrotSessionLnAnchor = snap.sessionLnAnchor
+
+        val bw = minOf(vw, MANDEL_MAX_BITMAP_DIM)
+        val bh = minOf(maxOf(1, bw * vh / vw), MANDEL_MAX_BITMAP_DIM)
+        val plotKind = FractalPlotKind.entries[loaded.lastPlotKindOrdinal]
+        enqueueFractalBitmapJob(bw, bh, snap, plotKind, commitSessionBestTo = null, prewarmAfterRender = true)
+    }
+
+    private fun cycleFractalPlotAndRender() {
+        val snap = mandelbrotRenderSnapshot ?: return
+        val container = chartMandelbrotFragment?.view ?: return
+        val vw = container.width
+        val vh = container.height
+        if (vw <= 0 || vh <= 0) return
+        val bw = minOf(vw, MANDEL_MAX_BITMAP_DIM)
+        val bh = minOf(maxOf(1, bw * vh / vw), MANDEL_MAX_BITMAP_DIM)
+        val n = FractalPlotKind.entries.size
+        fractalPlotOrdinal = (fractalPlotOrdinal + 1) % n
+        val plotKind = FractalPlotKind.entries[fractalPlotOrdinal]
+        enqueueFractalBitmapJob(bw, bh, snap, plotKind, commitSessionBestTo = null)
+    }
+
+    /**
+     * Renders off main thread; optionally commits [mandelbrotLastRenderedSessionBest] when [commitSessionBestTo] non-null (mining path).
+     */
+    private fun enqueueFractalBitmapJob(
+        bw: Int,
+        bh: Int,
+        snap: MandelbrotRenderSnapshot,
+        plotKind: FractalPlotKind,
+        commitSessionBestTo: Double?,
+        prewarmAfterRender: Boolean = false,
+    ) {
+        mandelbrotRenderJob?.cancel()
+        val key = fractalBitmapCacheKey(snap, bw, bh, plotKind)
+        val cached = fractalBitmapCache[key]
+        if (cached != null && !cached.isRecycled) {
+            mandelbrotRenderJob = null
+            commitSessionBestTo?.let { mandelbrotLastRenderedSessionBest = it }
+            applyFractalBitmapToUi(cached, plotKind)
+            if (commitSessionBestTo != null || prewarmAfterRender) {
+                startFractalPrewarmAfterSnapshot(snap, bw, bh)
+            }
+            return
+        }
+        mandelbrotRenderJob = lifecycleScope.launch {
+            val bmp = try {
+                withContext(Dispatchers.Default) {
+                    MandelbrotEscapeRenderer.render(
+                        bw,
+                        bh,
+                        snap.sdPrev,
+                        snap.sdNew,
+                        snap.sessionLnAnchor,
+                        snap.sessionLnPeak,
+                        snap.rollingLnMin,
+                        snap.rollingLnMax,
+                        plotKind,
+                    )
+                }
+            } catch (_: OutOfMemoryError) {
+                null
+            }
+            if (bmp == null || !isActive) {
+                bmp?.recycle()
+                return@launch
+            }
+            commitSessionBestTo?.let { mandelbrotLastRenderedSessionBest = it }
+            fractalBitmapCache[key] = bmp
+            applyFractalBitmapToUi(bmp, plotKind)
+            if (commitSessionBestTo != null || prewarmAfterRender) {
+                startFractalPrewarmAfterSnapshot(snap, bw, bh)
+            }
+        }
+    }
+
+    /** Fills [fractalBitmapCache] for every [FractalPlotKind] at this snapshot; does not change the visible image. */
+    private fun startFractalPrewarmAfterSnapshot(snap: MandelbrotRenderSnapshot, bw: Int, bh: Int) {
+        fractalPrewarmJob?.cancel()
+        fractalPrewarmJob = lifecycleScope.launch {
+            for (kind in FractalPlotKind.entries) {
+                if (!isActive) return@launch
+                if (mandelbrotRenderSnapshot != snap) return@launch
+                val key = fractalBitmapCacheKey(snap, bw, bh, kind)
+                if (fractalBitmapCache.containsKey(key)) continue
+                val bmp = try {
+                    withContext(Dispatchers.Default) {
+                        MandelbrotEscapeRenderer.render(
+                            bw,
+                            bh,
+                            snap.sdPrev,
+                            snap.sdNew,
+                            snap.sessionLnAnchor,
+                            snap.sessionLnPeak,
+                            snap.rollingLnMin,
+                            snap.rollingLnMax,
+                            kind,
+                        )
+                    }
+                } catch (_: OutOfMemoryError) {
+                    null
+                }
+                if (!isActive) {
+                    bmp?.recycle()
+                    return@launch
+                }
+                if (mandelbrotRenderSnapshot != snap) {
+                    bmp?.recycle()
+                    return@launch
+                }
+                if (bmp != null) fractalBitmapCache[key] = bmp
+            }
+        }
+    }
+
+    private fun fractalDisplayName(kind: FractalPlotKind): String = when (kind) {
+        FractalPlotKind.Mandelbrot -> getString(R.string.fractal_name_mandelbrot)
+        FractalPlotKind.Julia -> getString(R.string.fractal_name_julia)
+        FractalPlotKind.BurningShip -> getString(R.string.fractal_name_burning_ship)
+        FractalPlotKind.Multibrot -> getString(R.string.fractal_name_multibrot)
+        FractalPlotKind.Tricorn -> getString(R.string.fractal_name_tricorn)
+        FractalPlotKind.Phoenix -> getString(R.string.fractal_name_phoenix)
+        FractalPlotKind.Newton -> getString(R.string.fractal_name_newton)
+    }
+
+    private fun updateFractalChartCaption(kind: FractalPlotKind?) {
+        val captionView = chartMandelbrotFragment?.chartBinding?.mandelbrotCaption ?: return
+        if (kind == null) {
+            captionView.text = ""
+            return
+        }
+        captionView.text = getString(R.string.fractal_chart_caption_pattern, fractalDisplayName(kind))
+    }
+
+    /**
+     * Redraws Mandelbrot only when session best share difficulty increases during mining.
+     * Last bitmap persists while idle (plan parity with other charts).
+     */
+    private fun refreshMandelbrotIfNeeded() {
+        val svc = miningService ?: return
+        if (svc.getStatus().state != MiningStatus.State.Mining) return
+        val sessionStart = svc.getMiningStartTimeMillis() ?: return
+
+        if (mandelbrotSessionKey != sessionStart) {
+            mandelbrotSessionKey = sessionStart
+            mandelbrotLastRenderedSessionBest = 0.0
+            mandelbrotSessionLnAnchor = null
+            mandelbrotRollingLnHighs.clear()
+            fractalPlotOrdinal = -1
+            mandelbrotRenderSnapshot = null
+            lastRenderedFractalPlotKind = null
+            updateFractalChartCaption(null)
+            recycleAllFractalBitmapMemory()
+            statsRepository.clearFractalChartState()
+            setupMandelbrotView()
+        }
+
+        val sessionBest = svc.getSessionBestDifficultyForDisplay()
+        if (!sessionBest.isFinite() || sessionBest <= mandelbrotLastRenderedSessionBest) return
+
+        invalidateFractalBitmapCacheForSnapshotChange()
+
+        val sdPrev = if (mandelbrotLastRenderedSessionBest <= 0.0) MANDEL_EPS_PREV else mandelbrotLastRenderedSessionBest
+        val sdNew = sessionBest
+
+        val lnNew = ln(sdNew)
+        if (mandelbrotSessionLnAnchor == null) {
+            mandelbrotSessionLnAnchor = lnNew
+        }
+        mandelbrotRollingLnHighs.addLast(lnNew)
+        while (mandelbrotRollingLnHighs.size > MANDEL_ROLLING_LN_COUNT) {
+            mandelbrotRollingLnHighs.removeFirst()
+        }
+        val rollingLnMin: Double?
+        val rollingLnMax: Double?
+        if (mandelbrotRollingLnHighs.size >= 2) {
+            rollingLnMin = mandelbrotRollingLnHighs.minOrNull()
+            rollingLnMax = mandelbrotRollingLnHighs.maxOrNull()
+        } else {
+            rollingLnMin = null
+            rollingLnMax = null
+        }
+        val sessionLnAnchor = mandelbrotSessionLnAnchor!!
+        val sessionLnPeak = lnNew
+
+        val container = chartMandelbrotFragment?.view ?: return
+        val vw = container.width
+        val vh = container.height
+        if (vw <= 0 || vh <= 0) {
+            container.post { refreshMandelbrotIfNeeded() }
+            return
+        }
+
+        val bw = minOf(vw, MANDEL_MAX_BITMAP_DIM)
+        val bh = minOf(maxOf(1, bw * vh / vw), MANDEL_MAX_BITMAP_DIM)
+
+        val n = FractalPlotKind.entries.size
+        fractalPlotOrdinal = (fractalPlotOrdinal + 1) % n
+        val plotKind = FractalPlotKind.entries[fractalPlotOrdinal]
+        val snap = MandelbrotRenderSnapshot(
+            sdPrev,
+            sdNew,
+            sessionLnAnchor,
+            sessionLnPeak,
+            rollingLnMin,
+            rollingLnMax,
+        )
+        mandelbrotRenderSnapshot = snap
+        enqueueFractalBitmapJob(bw, bh, snap, plotKind, commitSessionBestTo = sdNew)
+    }
+
+    private fun syncDonutRimLabels() {
+        val bb = chartSharesDonutFragment?.chartBinding ?: return
+        SharesDonutRimLabelHelper.updateIfHighlighted(
+            bb.sharesDonutChart,
+            bb.donutRimLabelsOverlay,
+            bb.donutRimCpuPct,
+            bb.donutRimGpuPct,
+            getString(R.string.shares_donut_cpu_label),
+            getString(R.string.shares_donut_gpu_label),
+        )
+    }
+
+    /** Pool `mining.set_difficulty` for dashboard (not best share difficulty). */
+    private fun formatStratumDifficultyDisplay(status: MiningStatus): String {
+        if (status.state != MiningStatus.State.Mining) return "—"
+        val d = status.stratumDifficulty ?: return "—"
+        if (!d.isFinite() || d <= 0.0) return "—"
+        return if (d in 1e-12..1e15) {
+            BigDecimal.valueOf(d).stripTrailingZeros().toPlainString()
+        } else {
+            String.format(Locale.US, "%.6g", d)
+        }
+    }
+
+    private fun formatHashRateRowText(
+        status: HashRateDisplay.RowStatus,
+        rateHs: Double,
+    ): String = when (status) {
+        HashRateDisplay.RowStatus.Hashing ->
+            "${NumberFormatUtils.formatHashrateWithSpaces(rateHs)} H/s"
+        HashRateDisplay.RowStatus.Initializing -> getString(R.string.hash_rate_initializing)
+        HashRateDisplay.RowStatus.Off -> "—"
+    }
+
+    private fun updateStatsUi(status: MiningStatus, service: MiningForegroundService?) {
+        page1Fragment?.pageBinding?.let { p1 ->
+            val config = configRepository.getConfig()
+            val miningRequested = service?.isMiningRequested() == true || statsRepository.isMiningRequested()
+            val startInProgress = service?.isStartInProgress() == true
+            val connectingOrResuming = HashRateDisplay.connectingOrResuming(
+                status.state,
+                miningRequested,
+                startInProgress,
+            )
+            val mining = status.state == MiningStatus.State.Mining
+            val cpuWanted = config.maxWorkerThreads > 0
+            val gpuWanted = status.gpuWanted || (config.gpuEnabled && GpuCapabilities.isVulkanAvailable())
+            p1.hashRateValue.text = formatHashRateRowText(
+                HashRateDisplay.rowStatus(
+                    backendWanted = cpuWanted,
+                    stateMining = mining,
+                    connectingOrResuming = connectingOrResuming,
+                    backendRetrying = false,
+                ),
+                status.hashrateHs,
+            )
+            p1.gpuHashRateValue.text = formatHashRateRowText(
+                HashRateDisplay.rowStatus(
+                    backendWanted = gpuWanted,
+                    stateMining = mining,
+                    connectingOrResuming = connectingOrResuming,
+                    backendRetrying = gpuWanted && !status.gpuAvailable,
+                ),
+                status.gpuHashrateHs,
+            )
+            val maxCoresUi = Runtime.getRuntime().availableProcessors()
+            val cpuCoresForLabel = config.maxWorkerThreads.coerceIn(0, maxCoresUi)
+            p1.hashRateLabel.text = getString(R.string.hash_rate_label) + " - " + cpuCoresForLabel
+            val gpuLocalSizeX = if (config.gpuEnabled) {
+                config.clampedGpuLocalSizeX(GpuCapabilities.maxLocalSizeX())
+            } else {
+                0
+            }
+            val gpuHashesPerThread = if (config.gpuEnabled) {
+                MiningConfig.clampGpuHashesPerThread(config.gpuHashesPerThread)
+            } else {
+                0
+            }
+            p1.gpuHashRateLabel.text = getString(R.string.hash_rate_gpu_label) +
+                if (config.gpuEnabled) " - ${gpuLocalSizeX}×$gpuHashesPerThread" else ""
+            p1.cpuUtilizationValue.text = formatStratumDifficultyDisplay(status)
+            p1.noncesValue.text = NumberFormatUtils.formatWithSpaces(status.noncesScanned)
+            val sessionActive = service?.isSessionActiveForDisplay() == true ||
+                (service == null && statsRepository.isMiningRequested())
+            val (sessionAcc, sessionRej, sessionId) = if (sessionActive && service != null) {
+                service.getSessionShareDisplayedCounts()
+            } else if (sessionActive) {
+                val b = statsRepository.getShareSessionBaselines()
+                Triple(
+                    (status.acceptedShares - b.accepted).coerceAtLeast(0L),
+                    (status.rejectedShares - b.rejected).coerceAtLeast(0L),
+                    (status.identifiedShares - b.identified).coerceAtLeast(0L),
+                )
+            } else {
+                statsRepository.getLastStoppedSessionShareDisplay()
+            }
+            p1.acceptedSharesValue.text = sessionAcc.toString()
+            p1.rejectedSharesValue.text = sessionRej.toString()
+            p1.identifiedSharesValue.text = sessionId.toString()
+            p1.queuedSharesValue.text = status.queuedShares.toString()
+            val sessionBestDiff = if (sessionActive && service != null) {
+                service.getSessionBestDifficultyForDisplay()
+            } else {
+                statsRepository.getLastStoppedSessionBestBlockDisplay().first
+            }
+            p1.bestDifficultyValue.text = if (sessionBestDiff > 0.0) String.format(Locale.US, "%.6f", sessionBestDiff) else "—"
+            val sessionBlockTemplates = if (sessionActive && service != null) {
+                service.getSessionBlockTemplateDisplayedCount()
+            } else if (sessionActive) {
+                val b = statsRepository.getShareSessionBaselines()
+                (status.blockTemplates - b.blockTemplates).coerceAtLeast(0L)
+            } else {
+                statsRepository.getLastStoppedSessionBestBlockDisplay().second
+            }
+            p1.blockTemplateValue.text = sessionBlockTemplates.toString()
+            val startMs = service?.getMiningStartTimeMillis()
+            val (timerStr, timerLabel) = if (status.state == MiningStatus.State.Mining && startMs != null) {
+                formatElapsed(System.currentTimeMillis() - startMs) to getString(R.string.mining_timer_label)
+            } else {
+                val lastRunMs = statsRepository.getLastRunDurationMs()
+                if (lastRunMs > 0) {
+                    formatElapsed(lastRunMs) to getString(R.string.mining_timer_last_run)
+                } else {
+                    "00:00:00:00" to getString(R.string.mining_timer_label)
+                }
+            }
+            p1.miningTimerValue.text = timerStr
+            p1.miningTimerLabel.text = timerLabel
+            p1.stratumConnectionIcon.alpha = if (status.state == MiningStatus.State.Mining && !status.connectionLost) 1f else 0.3f
+        }
+        binding.reconnectingBanner.visibility = if (MiningConstraints.isBothWifiAndDataUnavailable(this) && status.connectionLost) View.VISIBLE else View.GONE
+    }
+
+    private fun refreshDashboardFromPoll() {
+        updateBatteryTempUi()
+        val service = miningService
+        if (service != null) {
+            val status = service.getStatus()
+            updateStatsUi(status, service)
+            val isMining = status.state == MiningStatus.State.Mining
+            val cpu = service.getHashrateHistoryCpu()
+            val gpu = service.getHashrateHistoryGpu()
+            val elapsed = service.getHashrateHistoryElapsedSec()
+            val batt = service.getBatteryTempHistoryCelsius()
+            val n = minOf(cpu.size, gpu.size, elapsed.size, batt.size)
+            if (n > 0 && (isMining || service.isSessionActiveForDisplay())) {
+                updateChart(cpu, gpu, elapsed, batt)
+                updateTelemetryChartFromLive(service, elapsed)
+                val src = service.getSessionIdentifiedShareSourceCounts()
+                if (lastDonutIdentifiedCounts != src) {
+                    if (updateSharesDonutChart(src.first, src.second)) {
+                        lastDonutIdentifiedCounts = src
+                    }
+                }
+            } else if (isMining) {
+                renderPersistedChartsOrIdleFallback()
+            } else {
+                renderPersistedChartsOrIdleFallback()
+            }
+        } else {
+            updateStatsUi(statsRepository.get(), null)
+            renderPersistedChartsOrIdleFallback()
+        }
+        updateLifetimeUi()
+        updateLifetimePanel2Ui()
+        updateStratumJsonPanels()
+        val config = configRepository.getConfig()
+        if (config.autoTuningByBatteryTemp && service != null) {
+            binding.autoTuneBlock.visibility = View.VISIBLE
+            binding.autoTuneValue.text = "${service.getAutoTuningThrottleSleepMs() / 1000}"
+            val dir = service.getAutoTuningDirection()
+            val color = when (dir) {
+                MiningForegroundService.AUTO_TUNING_DIRECTION_DECREASING -> ContextCompat.getColor(this, R.color.auto_tune_decreasing)
+                MiningForegroundService.AUTO_TUNING_DIRECTION_INCREASING -> ContextCompat.getColor(this, R.color.bitcoin_orange)
+                else -> ContextCompat.getColor(this, R.color.white)
+            }
+            binding.autoTuneValue.setTextColor(color)
+        } else {
+            binding.autoTuneBlock.visibility = View.GONE
+        }
+        refreshBestDifficultyChart()
+        refreshMandelbrotIfNeeded()
+        updateThermalChartUi()
+    }
+
+    private fun refreshTelemetryChartFromCurrentSource() {
+        val service = miningService
+        if (service != null && service.getStatus().state == MiningStatus.State.Mining) {
+            val elapsed = service.getHashrateHistoryElapsedSec()
+            if (elapsed.isNotEmpty()) {
+                updateTelemetryChartFromLive(service, elapsed)
+                return
+            }
+        }
+        val snapshot = statsRepository.getChartSnapshotOrNull()
+        if (snapshot != null) {
+            updateTelemetryChartFromSnapshot(snapshot)
+        } else {
+            clearTelemetryChartUi()
+        }
+    }
+
+    private fun updateTelemetryChartFromLive(service: MiningForegroundService, elapsed: List<Float>) {
+        updateTelemetryChart(
+            cpussAvgC = service.getTelemetryHistoryCpussAvgC(),
+            cpuAvgC = service.getTelemetryHistoryCpuAvgC(),
+            gpussAvgC = service.getTelemetryHistoryGpussAvgC(),
+            gpuAvgC = service.getTelemetryHistoryGpuAvgC(),
+            skinC = service.getTelemetryHistorySkinC(),
+            batteryAvgC = service.getTelemetryHistoryBatteryAvgC(),
+            cpuClkMhz = service.getTelemetryHistoryCpuClkMhz(),
+            gpuClkMhz = service.getTelemetryHistoryGpuClkMhz(),
+            avgWorkMs = service.getTelemetryHistoryAvgWorkMs(),
+            historyElapsedSec = elapsed,
+        )
+    }
+
+    private fun updateTelemetryChartFromSnapshot(snapshot: ChartSnapshot) {
+        updateTelemetryChart(
+            cpussAvgC = snapshot.cpussAvgC,
+            cpuAvgC = snapshot.cpuAvgC,
+            gpussAvgC = snapshot.gpussAvgC,
+            gpuAvgC = snapshot.gpuAvgC,
+            skinC = snapshot.skinC,
+            batteryAvgC = snapshot.telemetryBatteryAvgC,
+            cpuClkMhz = snapshot.cpuClkMhz,
+            gpuClkMhz = snapshot.gpuClkMhz,
+            avgWorkMs = snapshot.avgWorkMs,
+            historyElapsedSec = snapshot.elapsedSec,
+        )
+    }
+
+    private fun clearTelemetryChartUi() {
+        chartTelemetryFragment?.chartBinding?.let { c ->
+            c.telemetryChart.data = null
+            c.telemetryChart.legend.isEnabled = false
+            c.telemetryChartModeTitle.visibility = View.GONE
+            c.telemetryChartEmptyMessage.visibility = View.VISIBLE
+            c.telemetryChart.invalidate()
+        }
+    }
+
+    private fun updateThermalChartUi() {
+        val useF = configRepository.getConfig().batteryTempFahrenheit
+        lastThermalDisplayFahrenheit = useF
+        val state = miningService?.getThermalUiState() ?: DeviceTelemetryReader.getCachedUiState()
+        chartThermalFragment?.updateThermalChart(state, useF)
+    }
+
+    private fun renderPersistedChartsOrIdleFallback() {
+        val snapshot = statsRepository.getChartSnapshotOrNull()
+        if (snapshot != null) {
+            updateChart(
+                historyCpu = snapshot.cpu.map { it.toDouble() },
+                historyGpu = snapshot.gpu.map { it.toDouble() },
+                historyElapsedSec = snapshot.elapsedSec,
+                batteryTempHistoryCelsius = snapshot.batteryTempC,
+            )
+            updateTelemetryChartFromSnapshot(snapshot)
+            val donut = snapshot.donutCpuShares to snapshot.donutGpuShares
+            if (lastDonutIdentifiedCounts != donut) {
+                if (updateSharesDonutChart(snapshot.donutCpuShares, snapshot.donutGpuShares)) {
+                    lastDonutIdentifiedCounts = donut
+                }
+            }
+        } else {
+            val idle = 0L to 0L
+            if (lastDonutIdentifiedCounts != idle) {
+                if (updateSharesDonutChart(0L, 0L)) {
+                    lastDonutIdentifiedCounts = idle
+                }
+            }
+            chartHashrateFragment?.chartBinding?.let { c ->
+                c.hashRateChart.data = null
+                c.hashChartModeTitle.visibility = View.GONE
+                c.hashRateChart.invalidate()
+            }
+            clearTelemetryChartUi()
+        }
+    }
+
+    private fun updateLifetimeUi() {
+        val p3 = page3Fragment?.pageBinding ?: return
+        val s = statsRepository.getLifetimeStats()
+        p3.lifetimeTotalHashValue.text = "${NumberFormatUtils.formatHashrateWithSpaces(s.sumSessionAvgTotalHs)} H/s"
+        p3.lifetimeCpuHashValue.text = "${NumberFormatUtils.formatHashrateWithSpaces(s.sumSessionAvgCpuHs)} H/s"
+        p3.lifetimeGpuHashValue.text = "${NumberFormatUtils.formatHashrateWithSpaces(s.sumSessionAvgGpuHs)} H/s"
+        p3.lifetimeNoncesValue.text = NumberFormatUtils.formatWithSpaces(s.totalNonces)
+    }
+
+    private fun updateLifetimePanel2Ui() {
+        val p2 = page2Fragment?.pageBinding ?: return
+        val idle = statsRepository.get()
+        p2.lifetimeAcceptedSharesValue.text = idle.acceptedShares.toString()
+        p2.lifetimeRejectedSharesValue.text = idle.rejectedShares.toString()
+        p2.lifetimeIdentifiedSharesValue.text = idle.identifiedShares.toString()
+        p2.lifetimeBestDifficultyValue.text = if (idle.bestDifficulty > 0.0) String.format(Locale.US, "%.6f", idle.bestDifficulty) else "—"
+        p2.lifetimeBlockTemplateValue.text = idle.blockTemplates.toString()
+        p2.lifetimeTotalMiningTimeValue.text =
+            NumberFormatUtils.formatTotalMiningTimeYyMmDdHhMmSs(statsRepository.getTotalMiningTimeMs())
+
+        val heatMs = statsRepository.getHeatStopSessionMs()
+        if (heatMs <= 0L) {
+            p2.lifetimeHeatStopValue.text = getString(R.string.heat_stop_default)
+        } else {
+            val tempC = statsRepository.getHeatStopTempCelsius()
+            val useF = configRepository.getConfig().batteryTempFahrenheit
+            val tempPart = if (useF) {
+                val tempF = tempC * 9f / 5f + 32f
+                String.format(Locale.US, "%.1f °F", tempF)
+            } else {
+                String.format(Locale.US, "%.1f °C", tempC)
+            }
+            p2.lifetimeHeatStopValue.text =
+                "$tempPart - ${NumberFormatUtils.formatElapsedDdHhMmSs(heatMs)}"
+        }
+
+        val resumeCount = statsRepository.getResumeAttemptCount()
+        p2.lifetimeResumedMiningValue.text =
+            if (resumeCount <= 0L) getString(R.string.heat_stop_default) else resumeCount.toString()
+
+        val nbitsHex = miningService?.getCurrentStratumNbitsHex()?.trim().orEmpty()
+        val netDiff =
+            if (nbitsHex.isNotEmpty()) StratumHeaderBuilder.networkDifficultyFromNbitsHex(nbitsHex) else null
+        p2.lifetimeNetworkDifficultyValue.text =
+            if (netDiff != null) NumberFormatUtils.formatNetworkDifficultyForUi(netDiff) else "—"
+    }
+
+    private fun updateStratumJsonPanels() {
+        val p4 = page4Fragment?.pageBinding
+        val p5 = page5Fragment?.pageBinding
+        if (p4 == null && p5 == null) return
+
+        val service = miningService
+        val mining = service != null && service.getStatus().state == MiningStatus.State.Mining
+
+        val idle = getString(R.string.stratum_json_mining_inactive)
+        if (!mining) {
+            p4?.stratumJsonInputValue?.text = idle
+            p5?.stratumJsonOutputValue?.text = idle
+            p5?.stratumJsonOutputTitle?.text = getString(R.string.dashboard_page5_stratum_output_title)
+            p4?.stratumJsonInputIndicesFooter?.visibility = View.GONE
+            p5?.stratumJsonOutputIndicesFooter?.visibility = View.GONE
+            return
+        }
+
+        val rawIn = service!!.getLastStratumJsonIn().orEmpty()
+        val rawOut = service.getLastStratumJsonOut().orEmpty()
+
+        p5?.stratumJsonOutputTitle?.text = when (service.getLastStratumJsonOutSubmitSource()) {
+            StratumOutboundSubmitSource.Cpu -> getString(R.string.dashboard_page5_stratum_output_title_cpu_share)
+            StratumOutboundSubmitSource.Gpu -> getString(R.string.dashboard_page5_stratum_output_title_gpu_share)
+            null -> getString(R.string.dashboard_page5_stratum_output_title)
+        }
+
+        p4?.stratumJsonInputValue?.text = if (rawIn.isNotEmpty()) {
+            StratumJsonUiFormatter.prettyStratumJsonSpanned(this, rawIn)
+        } else {
+            "—"
+        }
+        p5?.stratumJsonOutputValue?.text = if (rawOut.isNotEmpty()) {
+            StratumJsonUiFormatter.prettyStratumJsonSpanned(this, rawOut)
+        } else {
+            "—"
+        }
+
+        val inFooter = if (rawIn.isNotEmpty()) {
+            StratumJsonUiFormatter.indicesFooter(this, rawIn, isInbound = true)
+        } else {
+            null
+        }
+        p4?.stratumJsonInputIndicesFooter?.let { ft ->
+            if (inFooter != null) {
+                ft.text = inFooter
+                ft.visibility = View.VISIBLE
+            } else {
+                ft.visibility = View.GONE
+            }
+        }
+
+        val outFooter = if (rawOut.isNotEmpty()) {
+            StratumJsonUiFormatter.indicesFooter(this, rawOut, isInbound = false)
+        } else {
+            null
+        }
+        p5?.stratumJsonOutputIndicesFooter?.let { ft ->
+            if (outFooter != null) {
+                ft.text = outFooter
+                ft.visibility = View.VISIBLE
+            } else {
+                ft.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun formatElapsed(elapsedMs: Long): String =
+        NumberFormatUtils.formatElapsedDdHhMmSs(elapsedMs)
+
+    private fun updateBatteryTempUi() {
+        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: run {
+            page1Fragment?.pageBinding?.batteryTempValue?.text = "—"
+            return
+        }
+        val tempTenthsC = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0)
+        val useF = configRepository.getConfig().batteryTempFahrenheit
+        val text = if (tempTenthsC == 0) "—" else {
+            val tempC = tempTenthsC / 10f
+            if (useF) {
+                val tempF = tempC * 9f / 5f + 32f
+                String.format(Locale.US, "%.1f °F", tempF)
+            } else {
+                String.format(Locale.US, "%.1f °C", tempC)
+            }
+        }
+        page1Fragment?.pageBinding?.batteryTempValue?.text = text
+    }
+
+    private fun clearStatsUi() {
+        lastDonutIdentifiedCounts = null
+        page1Fragment?.pageBinding?.let { p1 ->
+            p1.hashRateValue.text = "0.00 H/s"
+            p1.gpuHashRateValue.text = "0.00 H/s"
+            p1.cpuUtilizationValue.text = "—"
+            p1.miningTimerValue.text = "00:00:00:00"
+            p1.batteryTempValue.text = "—"
+            p1.bestDifficultyValue.text = "—"
+            p1.blockTemplateValue.text = "—"
+        }
+        binding.walletBalanceValue.text = "—"
+        binding.walletBalanceNote.visibility = View.GONE
+        chartHashrateFragment?.chartBinding?.let { c ->
+            c.hashRateChart.data = null
+            c.hashChartModeTitle.visibility = View.GONE
+            c.hashRateChart.invalidate()
+        }
+        chartSharesDonutFragment?.chartBinding?.let { c ->
+            val chart = c.sharesDonutChart
+            chart.data = null
+            chart.centerText = ""
+            val empty = getString(R.string.shares_donut_no_shares)
+            val orange = ContextCompat.getColor(this, R.color.bitcoin_orange)
+            SharesDonutCenterLabelHelper.setContent(c.donutCenterValue, empty, orange, maxLines = 2)
+            c.donutCenterValue.contentDescription = empty
+            chart.invalidate()
+            SharesDonutRimLabelHelper.hide(c.donutRimLabelsOverlay, c.donutRimCpuPct, c.donutRimGpuPct)
+            chart.post { SharesDonutCenterLabelHelper.updateLayout(chart, c.donutCenterValue) }
+        }
+        // Persistent counters (nonces) are not zeroed here; accepted/rejected/identified and best/block on page 1 are live per-session while mining, then last-stopped snapshots from prefs until the next start; lifetime stats on panels 2–3 reset only via Config "Reset All UI Counters"
+    }
+
+    private fun formatElapsedChartAxisSeconds(value: Float): String {
+        val totalSec = value.toLong().coerceAtLeast(0)
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        val s = totalSec % 60
+        return if (h > 0L) {
+            String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+        } else {
+            String.format(Locale.US, "%d:%02d", m, s)
+        }
+    }
+
+    private fun formatElapsedChartAxisHoursMinutes(value: Float): String {
+        val totalSec = value.toLong().coerceAtLeast(0)
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        return String.format(Locale.US, "%d:%02d", h, m)
+    }
+
+    /** MM:SS from elapsed seconds (no hour component); for short windows like the 2-min hashrate axis. */
+    private fun formatAxisMmSs(totalSec: Long): String {
+        val s = totalSec.coerceAtLeast(0)
+        val m = s / 60
+        val sec = s % 60
+        return String.format(Locale.US, "%d:%02d", m, sec)
+    }
+
+    private fun formatRelativeDurationAxis(sec: Double): String {
+        val s = sec.toLong().coerceAtLeast(0L)
+        val d = s / 86400L
+        val h = (s % 86400L) / 3600L
+        return if (d > 0L) {
+            String.format(Locale.US, "%dd %dh", d, h)
+        } else {
+            formatElapsedChartAxisSeconds(sec.toFloat())
+        }
+    }
+
+    /** X-axis labels for best-difficulty ordinal charts; [spanSec] picks compact style. */
+    private fun formatBestDiffAxisElapsedSec(elapsedSec: Double, spanSec: Double): String {
+        val esp = elapsedSec.coerceAtLeast(0.0)
+        val span = spanSec.coerceAtLeast(0.0)
+        val s = esp.toLong()
+        if (span >= 86400.0) {
+            val d = s / 86400L
+            val h = (s % 86400L) / 3600L
+            return String.format(Locale.US, "%dd %dh", d, h)
+        }
+        if (span > 600.0) {
+            val h = s / 3600L
+            val m = (s % 3600L) / 60L
+            return if (h > 0L) {
+                String.format(Locale.US, "%d:%02d", h, m)
+            } else {
+                String.format(Locale.US, "%dm", m)
+            }
+        }
+        return formatElapsedChartAxisSeconds(esp.toFloat())
+    }
+
+    private fun formatDifficultyChartAxis(d: Double): String =
+        when {
+            d >= 1e9 -> String.format(Locale.US, "%.3e", d)
+            d >= 1.0 -> String.format(Locale.US, "%.6g", d)
+            else -> String.format(Locale.US, "%.4g", d)
+        }
+
+    private fun refreshBestDifficultyChart() {
+        val events = statsRepository.getBestDifficultyEvents()
+        val svc = miningService
+        val mining = svc?.getStatus()?.state == MiningStatus.State.Mining
+        val sessionStart = if (mining) {
+            svc?.getMiningStartTimeMillis()
+        } else {
+            statsRepository.getLastStoppedSessionStartWallMs()
+        }
+        updateBestDifficultyChart(events, sessionStart)
+    }
+
+    private fun toggleBestDifficultyChartMode() {
+        bestDifficultyChartXMode = bestDifficultyChartXMode.toggle()
+        refreshBestDifficultyChart()
+    }
+
+    private fun updateBestDifficultyChart(events: List<BestDifficultyChartEvent>, currentSessionStartMs: Long?) {
+        val cb = chartBestDifficultyFragment?.chartBinding ?: return
+        val chart = cb.bestDifficultyChart
+        val chartTextColor = ContextCompat.getColor(this, R.color.chart_axis_legend)
+        val orange = ContextCompat.getColor(this, R.color.bitcoin_orange)
+        val green = Color.parseColor("#4CAF50")
+
+        val diffAxisFormatter = object : ValueFormatter() {
+            override fun getFormattedValue(value: Float): String {
+                val d = 10.0.pow(value.toDouble()).coerceAtLeast(BEST_DIFF_CHART_EPS_DIFF)
+                return formatDifficultyChartAxis(d)
+            }
+        }
+
+        when (bestDifficultyChartXMode) {
+            BestDifficultyChartXMode.HistoricalLinear -> {
+                chart.axisLeft.valueFormatter = diffAxisFormatter
+
+                if (events.isEmpty()) {
+                    chart.data = null
+                    chart.xAxis.resetAxisMinimum()
+                    chart.xAxis.resetAxisMaximum()
+                    chart.xAxis.isGranularityEnabled = false
+                } else {
+                    val t0Ms = events.first().tWallMs
+                    val spanSec = ((events.last().tWallMs - t0Ms) / 1000.0).coerceAtLeast(0.0)
+                    chart.xAxis.valueFormatter = object : ValueFormatter() {
+                        override fun getFormattedValue(value: Float): String {
+                            val idx = value.roundToInt().coerceIn(0, events.lastIndex)
+                            val el = (events[idx].tWallMs - t0Ms) / 1000.0
+                            return formatBestDiffAxisElapsedSec(el, spanSec)
+                        }
+                    }
+
+                    val orangeEntries = ArrayList<Entry>(events.size)
+                    val greenEntries = ArrayList<Entry>()
+                    events.forEachIndexed { i, e ->
+                        val ly = log10(e.difficulty.coerceAtLeast(BEST_DIFF_CHART_EPS_DIFF)).toFloat()
+                        orangeEntries.add(Entry(i.toFloat(), ly))
+                        if (currentSessionStartMs != null && e.sessionStartWallMs == currentSessionStartMs) {
+                            greenEntries.add(Entry(i.toFloat(), ly))
+                        }
+                    }
+
+                    val orangeSet = ScatterDataSet(orangeEntries, getString(R.string.best_difficulty_chart_legend_all)).apply {
+                        color = orange
+                        scatterShapeSize = 7f
+                        setScatterShape(ScatterChart.ScatterShape.CIRCLE)
+                        setDrawValues(false)
+                    }
+                    chart.data = if (greenEntries.isEmpty()) {
+                        ScatterData(orangeSet)
+                    } else {
+                        val greenSet = ScatterDataSet(greenEntries, getString(R.string.best_difficulty_chart_legend_session)).apply {
+                            color = green
+                            scatterShapeSize = 9f
+                            setScatterShape(ScatterChart.ScatterShape.CIRCLE)
+                            setDrawValues(false)
+                        }
+                        ScatterData(orangeSet, greenSet)
+                    }
+
+                    val n = events.size
+                    chart.xAxis.axisMinimum = 0f
+                    chart.xAxis.axisMaximum = (n - 1).coerceAtLeast(0).toFloat() + 0.5f
+                    chart.xAxis.isGranularityEnabled = true
+                    chart.xAxis.granularity = 1f
+                    chart.xAxis.setLabelCount(minOf(6, maxOf(2, n)), false)
+                }
+                cb.bestDiffChartModeTitle.text = getString(R.string.best_difficulty_chart_title_lifetime)
+            }
+            BestDifficultyChartXMode.SessionElapsedLinear -> {
+                chart.xAxis.resetAxisMinimum()
+                chart.xAxis.resetAxisMaximum()
+                chart.axisLeft.valueFormatter = diffAxisFormatter
+
+                if (currentSessionStartMs == null) {
+                    chart.data = null
+                    chart.xAxis.isGranularityEnabled = false
+                } else {
+                    val sessionStart = currentSessionStartMs
+                    val sessionEvents = events.filter { it.sessionStartWallMs == sessionStart }
+                    val greenEntries = ArrayList<Entry>(sessionEvents.size)
+                    for ((i, e) in sessionEvents.withIndex()) {
+                        val ly = log10(e.difficulty.coerceAtLeast(BEST_DIFF_CHART_EPS_DIFF)).toFloat()
+                        greenEntries.add(Entry(i.toFloat(), ly))
+                    }
+                    if (greenEntries.isEmpty()) {
+                        chart.data = null
+                        chart.xAxis.isGranularityEnabled = false
+                    } else {
+                        val spanSec = ((sessionEvents.last().tWallMs - sessionStart) / 1000.0).coerceAtLeast(0.0)
+                        chart.xAxis.valueFormatter = object : ValueFormatter() {
+                            override fun getFormattedValue(value: Float): String {
+                                val idx = value.roundToInt().coerceIn(0, sessionEvents.lastIndex)
+                                val el = (sessionEvents[idx].tWallMs - sessionStart) / 1000.0
+                                return formatBestDiffAxisElapsedSec(el, spanSec)
+                            }
+                        }
+                        val greenSet = ScatterDataSet(greenEntries, getString(R.string.best_difficulty_chart_legend_session)).apply {
+                            color = green
+                            scatterShapeSize = 9f
+                            setScatterShape(ScatterChart.ScatterShape.CIRCLE)
+                            setDrawValues(false)
+                        }
+                        chart.data = ScatterData(greenSet)
+                        val m = sessionEvents.size
+                        chart.xAxis.axisMinimum = 0f
+                        chart.xAxis.axisMaximum = (m - 1).coerceAtLeast(0).toFloat() + 0.5f
+                        chart.xAxis.isGranularityEnabled = true
+                        chart.xAxis.granularity = 1f
+                        chart.xAxis.setLabelCount(minOf(6, maxOf(2, m)), false)
+                    }
+                }
+                cb.bestDiffChartModeTitle.text = getString(R.string.best_difficulty_chart_title_session)
+            }
+        }
+        chart.legend.textColor = chartTextColor
+        val data = chart.data
+        chart.legend.isEnabled = data != null && data.dataSetCount > 0
+        cb.bestDiffChartModeTitle.visibility = View.VISIBLE
+        cb.bestDiffChartModeTitle.setTextColor(chartTextColor)
+        chart.invalidate()
+    }
+
+    private fun updateChart(
+        historyCpu: List<Double>,
+        historyGpu: List<Double>,
+        historyElapsedSec: List<Float>,
+        batteryTempHistoryCelsius: List<Float>,
+    ) {
+        val chartBinding = chartHashrateFragment?.chartBinding ?: return
+        val chart = chartBinding.hashRateChart
+        val chartTextColor = ContextCompat.getColor(this, R.color.chart_axis_legend)
+        val nAll = minOf(
+            historyCpu.size,
+            historyGpu.size,
+            historyElapsedSec.size,
+            batteryTempHistoryCelsius.size,
+        )
+        if (nAll == 0) {
+            chart.data = null
+            chartBinding.hashChartModeTitle.visibility = View.GONE
+            chart.invalidate()
+            return
+        }
+
+        val from = when (hashChartMode) {
+            HashChartMode.TwoMinute -> maxOf(0, nAll - HASHRATE_CHART_TWO_MIN_SAMPLES)
+            HashChartMode.TenMinute -> maxOf(0, nAll - HASHRATE_CHART_TEN_MIN_SAMPLES)
+            HashChartMode.Session -> 0
+        }
+        val cpuSlice = historyCpu.subList(from, nAll)
+        val gpuSlice = historyGpu.subList(from, nAll)
+        val battSliceC = batteryTempHistoryCelsius.subList(from, nAll)
+
+        val sessionDurationSec = historyElapsedSec[nAll - 1]
+        val windowAxisOriginSec = historyElapsedSec[from]
+
+        chart.xAxis.valueFormatter = when (hashChartMode) {
+            HashChartMode.TwoMinute, HashChartMode.TenMinute -> object : ValueFormatter() {
+                override fun getFormattedValue(value: Float): String =
+                    formatAxisMmSs(value.toLong().coerceAtLeast(0))
+            }
+            HashChartMode.Session -> object : ValueFormatter() {
+                override fun getFormattedValue(value: Float): String =
+                    if (sessionDurationSec >= 3600f) {
+                        formatElapsedChartAxisHoursMinutes(value)
+                    } else {
+                        formatElapsedChartAxisSeconds(value)
+                    }
+            }
+        }
+        chart.xAxis.isGranularityEnabled = false
+
+        val maxSize = cpuSlice.size
+        val orange = ContextCompat.getColor(this, R.color.bitcoin_orange)
+        val gray = Color.GRAY
+        val green = Color.parseColor("#4CAF50")
+        val magenta = Color.MAGENTA
+
+        fun xForIndex(i: Int): Float = when (hashChartMode) {
+            HashChartMode.TwoMinute, HashChartMode.TenMinute ->
+                (historyElapsedSec[from + i] - windowAxisOriginSec).coerceAtLeast(0f)
+            HashChartMode.Session -> historyElapsedSec[from + i]
+        }
+
+        val cpuEntries = cpuSlice.mapIndexed { i, v -> Entry(xForIndex(i), v.toFloat()) }
+        val cpuSet = LineDataSet(cpuEntries, "CPU").apply {
+            setColor(gray)
+            setCircleColor(gray)
+            lineWidth = 2f
+            setDrawCircles(false)
+            setDrawValues(false)
+        }
+
+        val gpuEntries = gpuSlice.mapIndexed { i, v -> Entry(xForIndex(i), v.toFloat()) }
+        val gpuSet = LineDataSet(gpuEntries, "GPU").apply {
+            setColor(green)
+            setCircleColor(green)
+            lineWidth = 2f
+            setDrawCircles(false)
+            setDrawValues(false)
+        }
+
+        val totalHistory = (0 until maxSize).map { i -> cpuSlice[i] + gpuSlice[i] }
+        val avg = if (totalHistory.isNotEmpty()) totalHistory.average() else 0.0
+        val avgEntries = (0 until maxSize).map { i -> Entry(xForIndex(i), avg.toFloat()) }
+        val avgSet = LineDataSet(avgEntries, "Avg").apply {
+            setColor(orange)
+            setCircleColor(orange)
+            lineWidth = 2f
+            setDrawCircles(false)
+            setDrawValues(false)
+            axisDependency = YAxis.AxisDependency.LEFT
+        }
+
+        val battEntries = battSliceC.mapIndexedNotNull { i, vC ->
+            if (!vC.isFinite()) return@mapIndexedNotNull null
+            Entry(xForIndex(i), vC)
+        }
+        val battSet = LineDataSet(battEntries, "BATT Temp").apply {
+            setColor(magenta)
+            setCircleColor(magenta)
+            lineWidth = 2f
+            setDrawCircles(false)
+            setDrawValues(false)
+            axisDependency = YAxis.AxisDependency.RIGHT
+        }
+
+        cpuSet.axisDependency = YAxis.AxisDependency.LEFT
+        gpuSet.axisDependency = YAxis.AxisDependency.LEFT
+
+        chart.data = LineData(cpuSet, gpuSet, avgSet, battSet)
+        applyHashRateChartOffsets(chart)
+        chart.legend.isEnabled = true
+        applyTelemetryChartLegend(
+            chart,
+            chartTextColor,
+            entryCount = 4,
+            legendYOffset = HASH_RATE_CHART_LEGEND_Y_OFFSET_DP,
+        )
+        chartBinding.hashChartModeTitle.visibility = View.VISIBLE
+        chartBinding.hashChartModeTitle.text = when (hashChartMode) {
+            HashChartMode.TwoMinute -> getString(R.string.hash_chart_title_2min)
+            HashChartMode.TenMinute -> getString(R.string.hash_chart_title_10min)
+            HashChartMode.Session -> getString(R.string.hash_chart_title_session)
+        }
+        chartBinding.hashChartModeTitle.setTextColor(chartTextColor)
+        chart.invalidate()
+    }
+
+    private fun updateTelemetryChart(
+        cpussAvgC: List<Float>,
+        cpuAvgC: List<Float>,
+        gpussAvgC: List<Float>,
+        gpuAvgC: List<Float>,
+        skinC: List<Float>,
+        batteryAvgC: List<Float>,
+        cpuClkMhz: List<Float>,
+        gpuClkMhz: List<Float>,
+        avgWorkMs: List<Float>,
+        historyElapsedSec: List<Float>,
+    ) {
+        val chartBinding = chartTelemetryFragment?.chartBinding ?: return
+        val chart = chartBinding.telemetryChart
+        val chartTextColor = ContextCompat.getColor(this, R.color.chart_axis_legend)
+        val nAll = historyElapsedSec.size
+        if (nAll == 0) {
+            clearTelemetryChartUi()
+            return
+        }
+
+        val from = when (telemetryChartMode) {
+            TelemetryChartMode.TwoMinute -> maxOf(0, nAll - HASHRATE_CHART_TWO_MIN_SAMPLES)
+            TelemetryChartMode.TenMinute -> maxOf(0, nAll - HASHRATE_CHART_TEN_MIN_SAMPLES)
+            TelemetryChartMode.Session -> 0
+        }
+
+        fun sliceOf(source: List<Float>): List<Float> =
+            (from until nAll).map { i -> source.getOrElse(i) { Float.NaN } }
+
+        val cpussSlice = sliceOf(cpussAvgC)
+        val cpuSlice = sliceOf(cpuAvgC)
+        val gpussSlice = sliceOf(gpussAvgC)
+        val gpuSlice = sliceOf(gpuAvgC)
+        val skinSlice = sliceOf(skinC)
+        val battSlice = sliceOf(batteryAvgC)
+        val cpuClkSlice = sliceOf(cpuClkMhz)
+        val gpuClkSlice = sliceOf(gpuClkMhz)
+        val avgWorkMsSlice = sliceOf(avgWorkMs)
+
+        val hasClocks = hasFiniteTelemetryValues(cpuClkSlice) || hasFiniteTelemetryValues(gpuClkSlice)
+        val hasAvgWorkMs = hasFiniteTelemetryValues(avgWorkMsSlice)
+        val avgWorkMsValues = avgWorkMsSlice.filter { it.isFinite() }
+        val msMin = avgWorkMsValues.minOrNull() ?: 0f
+        val msMax = avgWorkMsValues.maxOrNull() ?: 0f
+        val msRange = (msMax - msMin).coerceAtLeast(1e-3f)
+        val clockValues = (cpuClkSlice + gpuClkSlice).filter { it.isFinite() }
+        val mhzMin = clockValues.minOrNull() ?: 0f
+        val mhzMax = clockValues.maxOrNull() ?: 0f
+        val mhzRange = (mhzMax - mhzMin).coerceAtLeast(1e-3f)
+
+        fun mapMsToMhzPlot(ms: Float): Float =
+            mhzMin + (ms - msMin) / msRange * mhzRange
+
+        val sessionDurationSec = historyElapsedSec[nAll - 1]
+        val windowAxisOriginSec = historyElapsedSec[from]
+
+        chart.xAxis.valueFormatter = when (telemetryChartMode) {
+            TelemetryChartMode.TwoMinute, TelemetryChartMode.TenMinute -> object : ValueFormatter() {
+                override fun getFormattedValue(value: Float): String =
+                    formatAxisMmSs(value.toLong().coerceAtLeast(0))
+            }
+            TelemetryChartMode.Session -> object : ValueFormatter() {
+                override fun getFormattedValue(value: Float): String =
+                    if (sessionDurationSec >= 3600f) {
+                        formatElapsedChartAxisHoursMinutes(value)
+                    } else {
+                        formatElapsedChartAxisSeconds(value)
+                    }
+            }
+        }
+        chart.xAxis.isGranularityEnabled = false
+
+        val maxSize = nAll - from
+        fun xForIndex(i: Int): Float = when (telemetryChartMode) {
+            TelemetryChartMode.TwoMinute, TelemetryChartMode.TenMinute ->
+                (historyElapsedSec[from + i] - windowAxisOriginSec).coerceAtLeast(0f)
+            TelemetryChartMode.Session -> historyElapsedSec[from + i]
+        }
+
+        fun buildLineSet(
+            label: String,
+            slice: List<Float>,
+            color: Int,
+            axis: YAxis.AxisDependency,
+            yForValue: (Float) -> Float = { it },
+            configure: LineDataSet.() -> Unit = {},
+        ): LineDataSet? {
+            if (!hasFiniteTelemetryValues(slice)) return null
+            val entries = slice.mapIndexedNotNull { i, v ->
+                if (!v.isFinite()) return@mapIndexedNotNull null
+                Entry(xForIndex(i), yForValue(v))
+            }
+            if (entries.isEmpty()) return null
+            return LineDataSet(entries, label).apply {
+                setColor(color)
+                setCircleColor(color)
+                lineWidth = 2f
+                setDrawCircles(false)
+                setDrawValues(false)
+                axisDependency = axis
+                configure()
+            }
+        }
+
+        val tempSlices = listOf(
+            cpussSlice,
+            cpuSlice,
+            gpussSlice,
+            gpuSlice,
+            skinSlice,
+            battSlice,
+        )
+        val perSampleTempMeans = (0 until maxSize).map { i ->
+            val temps = tempSlices.mapNotNull { slice ->
+                slice[i].takeIf { it.isFinite() }
+            }
+            if (temps.isEmpty()) null else temps.average()
+        }
+
+        val datasets = ArrayList<LineDataSet>()
+        buildLineSet("CPUSS", cpussSlice, ContextCompat.getColor(this, R.color.chart_telemetry_cpuss), YAxis.AxisDependency.RIGHT)?.let { datasets.add(it) }
+        buildLineSet("CPU", cpuSlice, ContextCompat.getColor(this, R.color.chart_telemetry_cpu), YAxis.AxisDependency.RIGHT)?.let { datasets.add(it) }
+        buildLineSet("GPUSS", gpussSlice, ContextCompat.getColor(this, R.color.chart_telemetry_gpuss), YAxis.AxisDependency.RIGHT)?.let { datasets.add(it) }
+        buildLineSet("GPU", gpuSlice, ContextCompat.getColor(this, R.color.chart_telemetry_gpu), YAxis.AxisDependency.RIGHT)?.let { datasets.add(it) }
+        buildLineSet("SKIN", skinSlice, ContextCompat.getColor(this, R.color.chart_telemetry_skin), YAxis.AxisDependency.RIGHT)?.let { datasets.add(it) }
+        buildLineSet("BATT", battSlice, ContextCompat.getColor(this, R.color.chart_telemetry_batt), YAxis.AxisDependency.RIGHT)?.let { datasets.add(it) }
+
+        val finitePerSampleMeans = perSampleTempMeans.filterNotNull()
+        if (finitePerSampleMeans.isNotEmpty()) {
+            val avg = finitePerSampleMeans.average().toFloat()
+            val avgEntries = (0 until maxSize).map { i -> Entry(xForIndex(i), avg) }
+            datasets.add(
+                LineDataSet(avgEntries, "Avg").apply {
+                    setColor(ContextCompat.getColor(this@MainActivity, R.color.bitcoin_orange))
+                    setCircleColor(ContextCompat.getColor(this@MainActivity, R.color.bitcoin_orange))
+                    lineWidth = 2f
+                    setDrawCircles(false)
+                    setDrawValues(false)
+                    axisDependency = YAxis.AxisDependency.RIGHT
+                },
+            )
+        }
+
+        buildLineSet("CPU CLK", cpuClkSlice, ContextCompat.getColor(this, R.color.chart_telemetry_cpu_clk), YAxis.AxisDependency.LEFT)?.let { datasets.add(it) }
+        buildLineSet("GPU CLK", gpuClkSlice, ContextCompat.getColor(this, R.color.chart_telemetry_gpu_clk), YAxis.AxisDependency.LEFT)?.let { datasets.add(it) }
+
+        if (hasAvgWorkMs) {
+            val avgWorkMsColor = ContextCompat.getColor(this, R.color.chart_telemetry_avg_work_ms)
+            val yForAvgWorkMs: (Float) -> Float = if (hasClocks) ::mapMsToMhzPlot else { ms -> ms }
+            buildLineSet(
+                label = "avgWorkMs",
+                slice = avgWorkMsSlice,
+                color = avgWorkMsColor,
+                axis = YAxis.AxisDependency.LEFT,
+                yForValue = yForAvgWorkMs,
+            ) {
+                enableDashedLine(12f, 6f, 0f)
+            }?.let { datasets.add(it) }
+        }
+
+        if (datasets.isEmpty()) {
+            chart.data = null
+            chart.legend.isEnabled = false
+            chartBinding.telemetryChartModeTitle.visibility = View.GONE
+            chartBinding.telemetryChartEmptyMessage.visibility = View.VISIBLE
+            chart.invalidate()
+            return
+        }
+
+        val hasLeft = datasets.any { it.axisDependency == YAxis.AxisDependency.LEFT }
+        val hasRight = datasets.any { it.axisDependency == YAxis.AxisDependency.RIGHT }
+        chart.axisLeft.isEnabled = hasLeft
+        chart.axisRight.isEnabled = hasRight
+
+        chart.axisLeft.valueFormatter = when {
+            hasClocks && hasAvgWorkMs -> object : ValueFormatter() {
+                override fun getFormattedValue(value: Float): String {
+                    val msAtTick = mapMsAtMhzTick(value, mhzMin, mhzRange, msMin, msRange)
+                    return formatDualScaleLabel(value, msAtTick)
+                }
+            }
+            hasAvgWorkMs -> object : ValueFormatter() {
+                override fun getFormattedValue(value: Float): String =
+                    String.format(Locale.US, "%.0f Ms", value)
+            }
+            else -> object : ValueFormatter() {
+                override fun getFormattedValue(value: Float): String =
+                    String.format(Locale.US, "%.0f Mhz", value)
+            }
+        }
+        chart.axisLeft.maxWidth = if (hasClocks && hasAvgWorkMs) {
+            dualScaleMaxLabelWidthDp(mhzMax)
+        } else {
+            Float.POSITIVE_INFINITY
+        }
+        applyTelemetryChartOffsets(chart, hasClocks && hasAvgWorkMs)
+
+        chart.axisRight.valueFormatter = object : ValueFormatter() {
+            override fun getFormattedValue(value: Float): String {
+                val useF = configRepository.getConfig().batteryTempFahrenheit
+                val displayValue = if (useF) (value * 9f / 5f + 32f) else value
+                val unit = if (useF) "F" else "C"
+                return String.format(Locale.US, "%.1f%s", displayValue, unit)
+            }
+        }
+
+        chart.data = LineData(datasets as List<ILineDataSet>)
+        chart.legend.isEnabled = true
+        applyTelemetryChartLegend(chart, chartTextColor, datasets.size)
+        chartBinding.telemetryChartEmptyMessage.visibility = View.GONE
+        chartBinding.telemetryChartModeTitle.visibility = View.VISIBLE
+        chartBinding.telemetryChartModeTitle.text = when (telemetryChartMode) {
+            TelemetryChartMode.TwoMinute -> getString(R.string.telemetry_chart_title_2min)
+            TelemetryChartMode.TenMinute -> getString(R.string.telemetry_chart_title_10min)
+            TelemetryChartMode.Session -> getString(R.string.telemetry_chart_title_session)
+        }
+        chartBinding.telemetryChartModeTitle.setTextColor(chartTextColor)
+        chart.invalidate()
+    }
+
+    private fun updateSharesDonutChart(cpuShares: Long, gpuShares: Long): Boolean {
+        val b = chartSharesDonutFragment?.chartBinding ?: return false
+        val chart = b.sharesDonutChart
+        val orange = ContextCompat.getColor(this, R.color.bitcoin_orange)
+        val total = (cpuShares + gpuShares).coerceAtLeast(0L)
+        if (total <= 0L) {
+            chart.data = null
+            chart.centerText = ""
+            val empty = getString(R.string.shares_donut_no_shares)
+            // Same accent as numeric total; switch to chart_axis_legend if contrast in hole is poor on a theme.
+            SharesDonutCenterLabelHelper.setContent(b.donutCenterValue, empty, orange, maxLines = 2)
+            b.donutCenterValue.contentDescription = empty
+            chart.invalidate()
+            SharesDonutRimLabelHelper.hide(b.donutRimLabelsOverlay, b.donutRimCpuPct, b.donutRimGpuPct)
+            chart.post { SharesDonutCenterLabelHelper.updateLayout(chart, b.donutCenterValue) }
+            return true
+        }
+        val chartTextColor = ContextCompat.getColor(this, R.color.chart_axis_legend)
+        val gray = Color.GRAY
+        val green = Color.parseColor("#4CAF50")
+        val entries = listOf(
+            PieEntry(cpuShares.toFloat(), getString(R.string.shares_donut_cpu_label)),
+            PieEntry(gpuShares.toFloat(), getString(R.string.shares_donut_gpu_label)),
+        )
+        val set = PieDataSet(entries, "").apply {
+            colors = listOf(gray, green)
+            setDrawValues(false)
+            valueTextColor = chartTextColor
+            setSelectionShift(8f)
+        }
+        chart.data = PieData(set)
+        chart.centerText = ""
+        SharesDonutCenterLabelHelper.setContent(b.donutCenterValue, total.toString(), orange, maxLines = 1)
+        b.donutCenterValue.contentDescription = getString(R.string.shares_donut_center_value_a11y, total)
+        chart.legend.isEnabled = true
+        chart.legend.setCustom(
+            listOf(
+                LegendEntry(
+                    "${getString(R.string.shares_donut_cpu_label)}: $cpuShares",
+                    Legend.LegendForm.SQUARE,
+                    10f,
+                    2f,
+                    null,
+                    gray,
+                ),
+                LegendEntry(
+                    "${getString(R.string.shares_donut_gpu_label)}: $gpuShares",
+                    Legend.LegendForm.SQUARE,
+                    10f,
+                    2f,
+                    null,
+                    green,
+                ),
+            ),
+        )
+        chart.invalidate()
+        syncDonutRimLabels()
+        chart.post { SharesDonutCenterLabelHelper.updateLayout(chart, b.donutCenterValue) }
+        return true
+    }
+
+    private fun onStartMiningClicked() {
+        val config = configRepository.getConfig()
+        if (!config.isValidForMining()) {
+            Toast.makeText(this, R.string.mining_start_fail_config, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!MiningConstraints.isNetworkOk(this, config)) {
+            Toast.makeText(this, R.string.mining_start_fail_network, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!MiningConstraints.isChargingOk(this, config)) {
+            Toast.makeText(this, R.string.mining_start_fail_charging, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!config.hasActiveHashingConfig()) {
+            Toast.makeText(this, R.string.mining_start_fail_both_hashers_disabled, Toast.LENGTH_SHORT).show()
+            return
+        }
+        // Refresh Bitcoin balance when starting mining
+        handler.post(mempoolFetchRunnable)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestNotificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            tryStartMiningService()
+        }
+    }
+
+    private fun tryStartMiningService() {
+        purgeFractalStateForNewMiningSession()
+        MiningForegroundService.startAsForeground(this, MiningForegroundService.ACTION_START)
+    }
+
+    private fun onStopMiningClicked() {
+        startService(Intent(this, MiningForegroundService::class.java).apply {
+            action = MiningForegroundService.ACTION_STOP
+        })
+    }
+}

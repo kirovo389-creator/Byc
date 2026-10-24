@@ -1,0 +1,1467 @@
+package com.btcminer.android.mining
+
+import android.app.AlarmManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.ComponentCallbacks2
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.Build.VERSION_CODES
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import android.os.BatteryManager
+import android.os.PowerManager
+import android.widget.Toast
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.btcminer.android.AppLog
+import com.btcminer.android.MainActivity
+import com.btcminer.android.R
+import com.btcminer.android.config.MiningConfig
+import com.btcminer.android.config.MiningConfigRepository
+import com.btcminer.android.network.StratumPinCapture
+import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+
+class MiningForegroundService : Service() {
+
+    private lateinit var configRepository: MiningConfigRepository
+    private lateinit var statsRepository: MiningStatsRepository
+    private lateinit var pendingSharesRepository: PendingSharesRepository
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wakeLockRefCount = 0
+    private val wakeLockLock = Any()
+    private var alarmPendingIntent: PendingIntent? = null
+    private val throttleStateRef = AtomicReference(ThrottleState(100, false))
+    private val engine: MiningEngine by lazy {
+        val e = NativeMiningEngine(
+            throttleStateRef,
+            onPoolRedirectRequested = { host, port -> handler.post { showPoolRedirectNotification(host, port) } },
+            getStratumPin = configRepository::getStratumPin,
+            onPinVerified = { handler.post { Toast.makeText(applicationContext, R.string.security_confirmed_pool_cert_verified, Toast.LENGTH_SHORT).show() } },
+            pendingSharesRepository = pendingSharesRepository,
+            isBothWifiAndDataUnavailable = { MiningConstraints.isBothWifiAndDataUnavailable(applicationContext) },
+            statsLogExtra = {
+                val intent = applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                if (intent == null) "battery=—, "
+                else {
+                    val tempTenths = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0)
+                    if (tempTenths == 0) "battery=—, " else "battery=${"%.1f".format(tempTenths / 10.0)}°C, "
+                }
+            },
+            onGpuRetry = { attempt ->
+                handler.post { gpuRetryUiListener?.onGpuRetry(attempt) }
+            },
+            onGpuResumed = {
+                handler.post { gpuRetryUiListener?.onGpuResumed() }
+            },
+            onSessionBestDifficultyRecord = { recordedAtMs, difficulty ->
+                handler.post {
+                    val start = miningStartTimeMillis ?: return@post
+                    statsRepository.appendBestDifficultyEvent(recordedAtMs, difficulty, start)
+                }
+            },
+        )
+        e.loadPersistedStats(statsRepository.get())
+        e
+    }
+    private var constraintReceiver: BroadcastReceiver? = null
+    @Volatile
+    private var lastBatteryThrottleActive = false
+    @Volatile
+    private var lastHashrateThrottleActive = false
+    @Volatile
+    private var lastCpuThrottleActive = false
+    /** CPU throttle delay (ms) when CPU usage target is set and over target. */
+    @Volatile
+    private var cpuThrottleSleepMs: Long = 0L
+    private var miningStartTimeMillis: Long? = null
+    /** Wall-clock start of the current hashing segment (not including paused resume gaps). */
+    private var hashingSegmentStartMs: Long? = null
+    private var sessionAccumulatedHashedMs: Long = 0L
+    private val startInProgress = AtomicBoolean(false)
+    private var watchdogPendingIntent: PendingIntent? = null
+
+    /** Engine totals at session start; [getSessionShareDisplayedCounts] subtracts these for dashboard page 1. */
+    private var sessionBaselineAcceptedShares = 0L
+    private var sessionBaselineRejectedShares = 0L
+    private var sessionBaselineIdentifiedShares = 0L
+    private var sessionBaselineIdentifiedSharesCpu = 0L
+    private var sessionBaselineIdentifiedSharesGpu = 0L
+    private var sessionBaselineBlockTemplates = 0L
+
+    /** Current throttle sleep (ms) when auto-tuning is ON. 0–60_000. */
+    @Volatile
+    private var autoTuningThrottleSleepMs: Long = 0L
+    /** Last adjustment direction for dashboard: 0 = NONE, 1 = DECREASING, 2 = INCREASING */
+    @Volatile
+    private var autoTuningDirection: Int = 0
+
+    /** Samples (timestampMs, processCpuJiffies, systemCpuJiffies) for rolling-window CPU %. */
+    private val cpuUtilizationSamples = mutableListOf<Triple<Long, Long, Long>>()
+
+    /** Throttle CPU jiffies failure logs to once per 60s to avoid log spam when /proc/stat is blocked (e.g. EACCES). */
+    private var lastCpuJiffiesFailureLogMs: Long = 0
+    private fun logCpuJiffiesFailureIfThrottled(msg: () -> String) {
+        val now = System.currentTimeMillis()
+        if (now - lastCpuJiffiesFailureLogMs >= 60_000) {
+            lastCpuJiffiesFailureLogMs = now
+            AppLog.d(LOG_TAG, msg)
+        }
+    }
+
+    private val throttleThreadRunning = AtomicBoolean(false)
+    private var throttleThread: Thread? = null
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val sampleExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "mining-sample").apply { isDaemon = true }
+    }
+    private val hashrateHistoryLock = Any()
+    private val hashrateHistoryCpu = mutableListOf<Double>()
+    private val hashrateHistoryGpu = mutableListOf<Double>()
+    /** Wall-clock seconds since [miningStartTimeMillis] at each sample (aligned with CPU/GPU entries). */
+    private val hashrateHistoryElapsedSec = mutableListOf<Float>()
+    /** Per-sample battery temperature in Celsius (aligned with CPU/GPU/elapsed entries). */
+    private val batteryTempHistoryCelsius = mutableListOf<Float>()
+    private val telemetryHistoryCpussAvgC = mutableListOf<Float>()
+    private val telemetryHistoryCpuAvgC = mutableListOf<Float>()
+    private val telemetryHistoryGpussAvgC = mutableListOf<Float>()
+    private val telemetryHistoryGpuAvgC = mutableListOf<Float>()
+    private val telemetryHistorySkinC = mutableListOf<Float>()
+    private val telemetryHistoryBatteryAvgC = mutableListOf<Float>()
+    private val telemetryHistoryCpuClkMhz = mutableListOf<Float>()
+    private val telemetryHistoryGpuClkMhz = mutableListOf<Float>()
+    private val telemetryHistoryAvgWorkMs = mutableListOf<Float>()
+    @Volatile
+    private var lastChartSnapshotSaveMs: Long = 0L
+    @Volatile
+    private var lastMiningTimeCheckpointSaveMs: Long = 0L
+    @Volatile
+    private var lastThermalReadMs: Long = 0L
+    /** UI-only: hashrate history and notification. Heavy work runs on [sampleExecutor]; only startForeground on main. */
+    private val sampleRunnable: Runnable = object : Runnable {
+        override fun run() {
+            val self = this
+            if (engine.isRunning()) {
+                sampleExecutor.execute {
+                    val status = engine.getStatus()
+                    if (status.state == MiningStatus.State.Mining) {
+                        val tempTenthsC = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                            ?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+                        synchronized(hashrateHistoryLock) {
+                            hashrateHistoryCpu.add(status.hashrateHs)
+                            hashrateHistoryGpu.add(if (status.gpuAvailable) status.gpuHashrateHs else 0.0)
+                            val tempC = if (tempTenthsC != 0) tempTenthsC / 10f else Float.NaN
+                            val elapsedSec = (currentHashedElapsedMs() / 1000.0).toFloat()
+                            hashrateHistoryElapsedSec.add(elapsedSec)
+                            batteryTempHistoryCelsius.add(tempC)
+                            val batteryApiTempC = if (tempTenthsC != 0) tempTenthsC / 10.0 else null
+                            val telemetrySample = TelemetryChartSample.aggregateForChart(
+                                DeviceTelemetryReader.readSnapshot(),
+                                batteryApiTempC,
+                            )
+                            telemetryHistoryCpussAvgC.add(telemetrySample.cpussAvgC)
+                            telemetryHistoryCpuAvgC.add(telemetrySample.cpuAvgC)
+                            telemetryHistoryGpussAvgC.add(telemetrySample.gpussAvgC)
+                            telemetryHistoryGpuAvgC.add(telemetrySample.gpuAvgC)
+                            telemetryHistorySkinC.add(telemetrySample.skinC)
+                            telemetryHistoryBatteryAvgC.add(telemetrySample.batteryAvgC)
+                            telemetryHistoryCpuClkMhz.add(telemetrySample.cpuClkMhz)
+                            telemetryHistoryGpuClkMhz.add(telemetrySample.gpuClkMhz)
+                            telemetryHistoryAvgWorkMs.add(engine.drainChartAvgWorkMs())
+                        }
+                        maybeRefreshThermalUiState(tempTenthsC)
+                        maybePersistRuntimeSnapshots(force = false)
+                    }
+                    val contentText = if (MiningConstraints.isBothWifiAndDataUnavailable(applicationContext) && status.connectionLost) getString(R.string.mining_reconnecting) else getString(R.string.mining_notification_text)
+                    val notification = buildNotification(contentText)
+                    handler.post {
+                        if (engine.isRunning()) {
+                            startForeground(NOTIFICATION_ID, notification)
+                            handler.postDelayed(self, 1000L)
+                        }
+                    }
+                }
+            } else {
+                handler.postDelayed(self, 1000L)
+            }
+        }
+    }
+
+    /**
+     * Reads current process and system CPU times (jiffies). Returns null on read/parse error.
+     * Process: utime+stime from /proc/self/stat; system: sum of first line of /proc/stat (cpu ...).
+     */
+    private fun readCpuJiffies(): Pair<Long, Long>? {
+        val processStat = runCatching {
+            File("/proc/self/stat").readText()
+        }.getOrNull()
+        if (processStat == null) {
+            AppLog.d(LOG_TAG) { "readCpuJiffies: /proc/self/stat read failed" }
+            return null
+        }
+        val rparen = processStat.lastIndexOf(')')
+        if (rparen < 0) {
+            AppLog.d(LOG_TAG) { "readCpuJiffies: no ')' in process stat" }
+            return null
+        }
+        val afterComm = processStat.substring(rparen + 1).trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (afterComm.size < 13) {
+            AppLog.d(LOG_TAG) { "readCpuJiffies: afterComm.size=${afterComm.size} < 13" }
+            return null
+        }
+        val utime = afterComm[11].toLongOrNull()
+        val stime = afterComm[12].toLongOrNull()
+        if (utime == null || stime == null) {
+            AppLog.d(LOG_TAG) { "readCpuJiffies: utime/stime parse failed (utime=$utime stime=$stime)" }
+            return null
+        }
+        val processJiffies = utime + stime
+        val statLine = runCatching {
+            File("/proc/stat").readLines().firstOrNull()
+        }.fold(
+            onSuccess = { line ->
+                if (line == null) logCpuJiffiesFailureIfThrottled { "readCpuJiffies: /proc/stat first line null (empty file?)" }
+                line
+            },
+            onFailure = { null }
+        )
+        if (statLine == null) {
+            return null
+        }
+        val cpuParts = statLine.split(Regex("\\s+")).drop(1).filter { it.isNotEmpty() }.take(8)
+        if (cpuParts.size < 4) {
+            AppLog.d(LOG_TAG) { "readCpuJiffies: cpuParts.size=${cpuParts.size} < 4" }
+            return null
+        }
+        var systemJiffies = 0L
+        for (p in cpuParts) {
+            val v = p.toLongOrNull()
+            if (v == null) {
+                AppLog.d(LOG_TAG) { "readCpuJiffies: system jiffies parse failed for part '$p'" }
+                return null
+            }
+            systemJiffies += v
+        }
+        return processJiffies to systemJiffies
+    }
+
+    /** Runs on a dedicated thread; updates throttle every second so it is not deferred during Doze. */
+    private fun runThrottleLoop() {
+        while (throttleThreadRunning.get() && engine.isRunning()) {
+            val config = configRepository.getConfig()
+            val status = engine.getStatus()
+            val tempTenthsC = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                ?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+            val tempC = tempTenthsC / 10.0
+            val totalHs = status.hashrateHs + if (status.gpuAvailable) status.gpuHashrateHs else 0.0
+
+            val stopDueToOverheat = tempTenthsC != 0 && tempC >= MiningConfig.BATTERY_TEMP_HARD_STOP_C
+            val resumeTempC = config.maxBatteryTempC * 0.9
+            lastBatteryThrottleActive = when {
+                tempTenthsC == 0 -> lastBatteryThrottleActive
+                tempC >= config.maxBatteryTempC -> true
+                tempC <= resumeTempC -> false
+                else -> lastBatteryThrottleActive
+            }
+            val hashrateTarget = config.hashrateTargetHps
+            lastHashrateThrottleActive = when {
+                hashrateTarget == null -> false
+                totalHs > hashrateTarget -> true
+                totalHs <= hashrateTarget * 0.9 -> false
+                else -> lastHashrateThrottleActive
+            }
+            if (stopDueToOverheat) {
+                val tempAtStopC = tempTenthsC / 10f
+                handler.post {
+                    shutdownSessionDueToBatteryOverheat(tempAtStopC)
+                }
+                return
+            }
+            // CPU utilization: sample, rolling window, and optional throttle
+            val cpuSample = readCpuJiffies()
+            cpuSample?.let { (processJiffies, systemJiffies) ->
+                val nowMs = System.currentTimeMillis()
+                synchronized(cpuUtilizationSamples) {
+                    cpuUtilizationSamples.add(Triple(nowMs, processJiffies, systemJiffies))
+                    val cutoffMs = nowMs - CPU_UTILIZATION_ROLLING_WINDOW_SEC * 1000L
+                    while (cpuUtilizationSamples.isNotEmpty() && cpuUtilizationSamples.first().first < cutoffMs) {
+                        cpuUtilizationSamples.removeAt(0)
+                    }
+                    if (cpuUtilizationSamples.size >= 2) {
+                        val oldest = cpuUtilizationSamples.first()
+                        val latest = cpuUtilizationSamples.last()
+                        val systemDelta = latest.third - oldest.third
+                        if (systemDelta > 0L) {
+                            val processDelta = latest.second - oldest.second
+                            val pct = 100f * processDelta / systemDelta
+                            AppLog.d(LOG_TAG) { "CPU util: pct=${"%.1f".format(pct)}% samples=${cpuUtilizationSamples.size}" }
+                            val target = config.cpuUsageTargetPercent
+                            if (target != null) {
+                                val targetLo = target * 0.8f
+                                val targetHi = target.toFloat()
+                                lastCpuThrottleActive = when {
+                                    pct > targetHi -> {
+                                        cpuThrottleSleepMs = (cpuThrottleSleepMs + AUTO_TUNING_STEP_UP_MS).coerceIn(0L, AUTO_TUNING_SLEEP_MAX)
+                                        true
+                                    }
+                                    pct <= targetLo -> {
+                                        cpuThrottleSleepMs = (cpuThrottleSleepMs - AUTO_TUNING_STEP_DOWN_MS).coerceAtLeast(0L)
+                                        false
+                                    }
+                                    else -> lastCpuThrottleActive
+                                }
+                            } else {
+                                lastCpuThrottleActive = false
+                            }
+                        } else {
+                            AppLog.d(LOG_TAG) { "CPU util: systemDelta=$systemDelta <= 0, skip" }
+                        }
+                    } else {
+                        AppLog.d(LOG_TAG) { "CPU util: samples=${cpuUtilizationSamples.size} (need 2)" }
+                    }
+                }
+            }
+            if (config.cpuUsageTargetPercent == null) {
+                lastCpuThrottleActive = false
+            }
+            val batterySleep = if (config.autoTuningByBatteryTemp) {
+                val targetLo = config.maxBatteryTempC * AUTO_TUNING_TARGET_LO_RATIO
+                val targetHi = config.maxBatteryTempC * AUTO_TUNING_TARGET_HI_RATIO
+                if (tempTenthsC != 0) {
+                    when {
+                        tempC >= config.maxBatteryTempC -> {
+                            autoTuningThrottleSleepMs = THROTTLE_SLEEP_MS
+                            autoTuningDirection = AUTO_TUNING_DIRECTION_NONE
+                            lastBatteryThrottleActive = true
+                        }
+                        tempC < targetLo -> {
+                            autoTuningThrottleSleepMs = (autoTuningThrottleSleepMs - AUTO_TUNING_STEP_DOWN_MS).coerceAtLeast(0L)
+                            autoTuningDirection = AUTO_TUNING_DIRECTION_DECREASING
+                            lastBatteryThrottleActive = false
+                        }
+                        tempC in targetLo..targetHi -> {
+                            autoTuningDirection = AUTO_TUNING_DIRECTION_NONE
+                            lastBatteryThrottleActive = false
+                        }
+                        else -> {
+                            autoTuningThrottleSleepMs = (autoTuningThrottleSleepMs + AUTO_TUNING_STEP_UP_MS).coerceIn(0L, AUTO_TUNING_SLEEP_MAX)
+                            autoTuningDirection = AUTO_TUNING_DIRECTION_INCREASING
+                            lastBatteryThrottleActive = true
+                        }
+                    }
+                }
+                if (tempTenthsC != 0 && tempC >= config.maxBatteryTempC) THROTTLE_SLEEP_MS else autoTuningThrottleSleepMs
+            } else {
+                lastBatteryThrottleActive = when {
+                    tempTenthsC == 0 -> lastBatteryThrottleActive
+                    tempC >= config.maxBatteryTempC -> true
+                    tempC <= config.maxBatteryTempC * 0.9 -> false
+                    else -> lastBatteryThrottleActive
+                }
+                if (lastBatteryThrottleActive) THROTTLE_SLEEP_MS else 0L
+            }
+            val hashrateSleep = if (lastHashrateThrottleActive) THROTTLE_SLEEP_MS else 0L
+            val cpuSleep = if (lastCpuThrottleActive) cpuThrottleSleepMs else 0L
+            val throttleSleepMs = maxOf(batterySleep, hashrateSleep, cpuSleep)
+            throttleStateRef.set(ThrottleState(config.maxIntensityPercent, false, throttleSleepMs, config.gpuUtilizationPercent))
+            try {
+                Thread.sleep(1000L)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+    }
+
+    private val saveStatsRunnable: Runnable = object : Runnable {
+        override fun run() {
+            val self = this
+            sampleExecutor.execute {
+                statsRepository.save(engine.getStatus())
+                if (engine.isRunning()) {
+                    val start = miningStartTimeMillis
+                    if (start != null) {
+                        statsRepository.saveLastRunDuration(currentHashedElapsedMs())
+                        statsRepository.saveSessionAccumulatedHashedMs(currentHashedElapsedMs())
+                    }
+                }
+                handler.post {
+                    if (engine.isRunning()) handler.postDelayed(self, STATS_SAVE_INTERVAL_MS)
+                }
+            }
+        }
+    }
+
+    inner class LocalBinder : android.os.Binder() {
+        fun getService(): MiningForegroundService = this@MiningForegroundService
+    }
+
+    fun getStatus(): MiningStatus = engine.getStatus()
+
+    fun getCurrentStratumNbitsHex(): String? = engine.getCurrentStratumNbitsHex()
+
+    fun getLastStratumJsonIn(): String? = engine.getLastStratumJsonIn()
+
+    fun getLastStratumJsonOut(): String? = engine.getLastStratumJsonOut()
+
+    fun getLastStratumJsonOutSubmitSource(): StratumOutboundSubmitSource? =
+        engine.getLastStratumJsonOutSubmitSource()
+
+    /**
+     * Accepted / rejected / identified counts for the current mining session only (since last successful start).
+     * Zeros when not in a timed session and mining is not requested (resume-in-progress still shows counts).
+     */
+    fun getSessionShareDisplayedCounts(): Triple<Long, Long, Long> {
+        if (!isSessionActiveForDisplay()) return Triple(0L, 0L, 0L)
+        val s = engine.getStatus()
+        return Triple(
+            (s.acceptedShares - sessionBaselineAcceptedShares).coerceAtLeast(0L),
+            (s.rejectedShares - sessionBaselineRejectedShares).coerceAtLeast(0L),
+            (s.identifiedShares - sessionBaselineIdentifiedShares).coerceAtLeast(0L),
+        )
+    }
+
+    /** CPU/GPU identified share counts for the current session only. */
+    fun getSessionIdentifiedShareSourceCounts(): Pair<Long, Long> {
+        if (!isSessionActiveForDisplay()) return 0L to 0L
+        val bySource = engine.getIdentifiedSharesBySource()
+        return Pair(
+            (bySource.first - sessionBaselineIdentifiedSharesCpu).coerceAtLeast(0L),
+            (bySource.second - sessionBaselineIdentifiedSharesGpu).coerceAtLeast(0L),
+        )
+    }
+
+    private fun recordShareSessionBaselines() {
+        statsRepository.saveLastStoppedSessionShareDisplay(0L, 0L, 0L)
+        statsRepository.saveLastStoppedSessionBestBlockDisplay(0.0, 0L)
+        statsRepository.clearLastStoppedSessionStartWallMs()
+        engine.resetSessionScopeDisplay()
+        val s = engine.getStatus()
+        val bySource = engine.getIdentifiedSharesBySource()
+        sessionBaselineAcceptedShares = s.acceptedShares
+        sessionBaselineRejectedShares = s.rejectedShares
+        sessionBaselineIdentifiedShares = s.identifiedShares
+        sessionBaselineIdentifiedSharesCpu = bySource.first
+        sessionBaselineIdentifiedSharesGpu = bySource.second
+        sessionBaselineBlockTemplates = s.blockTemplates
+        persistShareSessionBaselines()
+    }
+
+    private fun persistShareSessionBaselines() {
+        statsRepository.saveShareSessionBaselines(
+            MiningStatsRepository.ShareSessionBaselines(
+                accepted = sessionBaselineAcceptedShares,
+                rejected = sessionBaselineRejectedShares,
+                identified = sessionBaselineIdentifiedShares,
+                identifiedCpu = sessionBaselineIdentifiedSharesCpu,
+                identifiedGpu = sessionBaselineIdentifiedSharesGpu,
+                blockTemplates = sessionBaselineBlockTemplates,
+            ),
+        )
+    }
+
+    private fun restoreShareSessionBaselines() {
+        val b = statsRepository.getShareSessionBaselines()
+        sessionBaselineAcceptedShares = b.accepted
+        sessionBaselineRejectedShares = b.rejected
+        sessionBaselineIdentifiedShares = b.identified
+        sessionBaselineIdentifiedSharesCpu = b.identifiedCpu
+        sessionBaselineIdentifiedSharesGpu = b.identifiedGpu
+        sessionBaselineBlockTemplates = b.blockTemplates
+    }
+
+    /** Panel #1: max share difficulty this session while mining; last-stopped snapshot when idle. */
+    fun getSessionBestDifficultyForDisplay(): Double =
+        if (isSessionActiveForDisplay()) engine.getSessionBestShareDifficulty()
+        else statsRepository.getLastStoppedSessionBestBlockDisplay().first
+
+    /** Panel #1: block templates this session (delta) while mining; last-stopped snapshot when idle. */
+    fun getSessionBlockTemplateDisplayedCount(): Long =
+        if (isSessionActiveForDisplay()) {
+            val s = engine.getStatus()
+            (s.blockTemplates - sessionBaselineBlockTemplates).coerceAtLeast(0L)
+        } else {
+            statsRepository.getLastStoppedSessionBestBlockDisplay().second
+        }
+
+    /** Reset persistent UI counters (accepted/rejected/identified shares, block templates, best difficulty, nonces). */
+    fun resetAllCounters() {
+        engine.resetAllCounters()
+        statsRepository.saveZeros()
+        if (isSessionActiveForDisplay()) {
+            recordShareSessionBaselines()
+        }
+    }
+
+    fun getHashrateHistoryCpu(): List<Double> = synchronized(hashrateHistoryLock) { hashrateHistoryCpu.toList() }
+    fun getHashrateHistoryGpu(): List<Double> = synchronized(hashrateHistoryLock) { hashrateHistoryGpu.toList() }
+    fun getHashrateHistoryElapsedSec(): List<Float> = synchronized(hashrateHistoryLock) { hashrateHistoryElapsedSec.toList() }
+    fun getBatteryTempHistoryCelsius(): List<Float> = synchronized(hashrateHistoryLock) { batteryTempHistoryCelsius.toList() }
+
+    fun getTelemetryHistoryCpussAvgC(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistoryCpussAvgC.toList() }
+    fun getTelemetryHistoryCpuAvgC(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistoryCpuAvgC.toList() }
+    fun getTelemetryHistoryGpussAvgC(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistoryGpussAvgC.toList() }
+    fun getTelemetryHistoryGpuAvgC(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistoryGpuAvgC.toList() }
+    fun getTelemetryHistorySkinC(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistorySkinC.toList() }
+    fun getTelemetryHistoryBatteryAvgC(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistoryBatteryAvgC.toList() }
+    fun getTelemetryHistoryCpuClkMhz(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistoryCpuClkMhz.toList() }
+    fun getTelemetryHistoryGpuClkMhz(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistoryGpuClkMhz.toList() }
+    fun getTelemetryHistoryAvgWorkMs(): List<Float> = synchronized(hashrateHistoryLock) { telemetryHistoryAvgWorkMs.toList() }
+
+    fun isBatteryThrottleActive(): Boolean = lastBatteryThrottleActive
+    fun isHashrateThrottleActive(): Boolean = lastHashrateThrottleActive
+    fun getThermalUiState(): ThermalUiState? = DeviceTelemetryReader.getCachedUiState()
+
+    fun getMiningStartTimeMillis(): Long? = miningStartTimeMillis
+
+    fun isStartInProgress(): Boolean = startInProgress.get()
+
+    fun isMiningRequested(): Boolean = statsRepository.isMiningRequested()
+
+    fun isSessionActiveForDisplay(): Boolean =
+        miningStartTimeMillis != null || statsRepository.isMiningRequested()
+
+    private fun maybeRefreshThermalUiState(tempTenthsC: Int) {
+        val now = System.currentTimeMillis()
+        if (now - lastThermalReadMs < THERMAL_READ_INTERVAL_MS) return
+        lastThermalReadMs = now
+        val batteryApiTempC = if (tempTenthsC != 0) tempTenthsC / 10.0 else null
+        val state = DeviceTelemetryReader.buildUiState(batteryApiTempC)
+        if (state.readings.isNotEmpty()) {
+            statsRepository.saveThermalChartState(state)
+        }
+    }
+
+
+    /** Current auto-tuning throttle sleep (ms). Only meaningful when auto-tuning is enabled in config. */
+    fun getAutoTuningThrottleSleepMs(): Long = autoTuningThrottleSleepMs
+
+    /** 0 = NONE, 1 = DECREASING, 2 = INCREASING. For dashboard color. */
+    fun getAutoTuningDirection(): Int = autoTuningDirection
+
+    override fun onCreate() {
+        super.onCreate()
+        configRepository = MiningConfigRepository(applicationContext)
+        statsRepository = MiningStatsRepository(applicationContext)
+        statsRepository.reconcileMiningTimeCheckpoint()
+        pendingSharesRepository = PendingSharesRepository(applicationContext)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> tryStartMining(freshSession = true)
+            ACTION_RESUME, ACTION_WATCHDOG -> handleWatchdogOrResume()
+            ACTION_STOP -> stopMining()
+            ACTION_RESTART -> restartMining()
+            ACTION_ALARM_WAKEUP -> handleAlarmWakeup()
+            else -> {
+                // Sticky restart (null intent) or bind-created start: resume if still wanted.
+                if (MiningResumePolicy.shouldAttemptResume(
+                        miningRequested = statsRepository.isMiningRequested(),
+                        engineRunning = engine.isRunning(),
+                        startInProgress = startInProgress.get(),
+                    )
+                ) {
+                    startForeground(NOTIFICATION_ID, createMinimalNotification())
+                    tryStartMining(freshSession = false)
+                }
+            }
+        }
+        return if (statsRepository.isMiningRequested() || engine.isRunning()) START_STICKY else START_NOT_STICKY
+    }
+
+    private fun handleWatchdogOrResume() {
+        startForeground(NOTIFICATION_ID, createMinimalNotification())
+        if (MiningResumePolicy.shouldAttemptResume(
+                miningRequested = statsRepository.isMiningRequested(),
+                engineRunning = engine.isRunning(),
+                startInProgress = startInProgress.get(),
+            )
+        ) {
+            tryStartMining(freshSession = false)
+        } else if (statsRepository.isMiningRequested()) {
+            scheduleWatchdog()
+        } else if (!engine.isRunning()) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun handleAlarmWakeup() {
+        startForeground(NOTIFICATION_ID, createMinimalNotification())
+        if (MiningResumePolicy.shouldAttemptResume(
+                miningRequested = statsRepository.isMiningRequested(),
+                engineRunning = engine.isRunning(),
+                startInProgress = startInProgress.get(),
+            )
+        ) {
+            tryStartMining(freshSession = false)
+            return
+        }
+        if (!engine.isRunning()) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        acquireWakeLock()
+        val config = configRepository.getConfig()
+        if (!config.useLegacyAlarm &&
+            config.alarmWakeIntervalSec in 1..MiningConfig.ALARM_WAKE_INTERVAL_SEC_MAX &&
+            engine.isRunning()
+        ) {
+            scheduleAlarm(config.alarmWakeIntervalSec, config.useLegacyAlarm)
+        }
+        handler.postDelayed({
+            releaseWakeLock()
+            if (!statsRepository.isMiningRequested() && !engine.isRunning()) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
+        }, WAKE_LOCK_HOLD_MS)
+    }
+
+    override fun onBind(intent: Intent?): IBinder = LocalBinder()
+
+    override fun onDestroy() {
+        maybePersistRuntimeSnapshots(force = true)
+        handler.removeCallbacks(sampleRunnable)
+        handler.removeCallbacks(saveStatsRunnable)
+        sampleExecutor.shutdown()
+        stopThrottleThread()
+        // If the service is destroyed without [stopMining] (e.g. killed), still record lifetime once while data exists.
+        if (engine.isRunning()) {
+            freezeHashedClock()
+            maybePersistRuntimeSnapshots(force = true)
+            finalizeLifetimeStatsForEndedSession()
+        }
+        // stop() refreshes statusRef from atomics before save — otherwise save() could re-persist stale share counts after resetAllCounters + saveZeros (idle bind path).
+        engine.stop()
+        statsRepository.save(engine.getStatus())
+        unregisterConstraintReceiver()
+        cancelAlarm()
+        if (!statsRepository.isMiningRequested()) {
+            cancelWatchdog()
+        }
+        releaseWakeLock()
+        super.onDestroy()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+    }
+
+    private fun tryStartMining(freshSession: Boolean) {
+        AppLog.d(LOG_TAG) { "tryStartMining(fresh=$freshSession)" }
+        startForeground(NOTIFICATION_ID, createMinimalNotification())
+        if (engine.isRunning()) {
+            if (statsRepository.isMiningRequested()) scheduleWatchdog()
+            return
+        }
+        if (!startInProgress.compareAndSet(false, true)) return
+        if (!freshSession && !statsRepository.isMiningRequested()) {
+            startInProgress.set(false)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        val config = configRepository.getConfig()
+        if (!config.isValidForMining() || !config.hasActiveHashingConfig()) {
+            startInProgress.set(false)
+            if (freshSession) {
+                Handler(Looper.getMainLooper()).post {
+                    if (!config.hasActiveHashingConfig()) {
+                        Toast.makeText(applicationContext, R.string.mining_start_fail_both_hashers_disabled, Toast.LENGTH_SHORT).show()
+                    }
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            } else {
+                scheduleWatchdog()
+            }
+            return
+        }
+        val chargingOk = MiningConstraints.isChargingOk(this, config)
+        if (MiningResumePolicy.shouldClearRequestedBecauseChargingConstraint(config.mineOnlyWhenCharging, chargingOk)) {
+            startInProgress.set(false)
+            if (freshSession) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            } else {
+                stopMining()
+            }
+            return
+        }
+        if (freshSession && !MiningConstraints.isNetworkOk(this, config)) {
+            startInProgress.set(false)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        if (freshSession) {
+            statsRepository.saveLastRunDuration(0)
+        } else {
+            statsRepository.incrementResumeAttemptCount()
+            restoreShareSessionBaselines()
+            restoreChartSnapshotIfPresent()
+            sessionAccumulatedHashedMs = statsRepository.getSessionAccumulatedHashedMs()
+        }
+        AppLog.d(LOG_TAG) { "startForeground done, starting engine on background thread" }
+        Thread {
+            val host = StratumPinCapture.normalizeHost(config.stratumUrl)
+            val useTls = StratumPinCapture.indicatesTls(config.stratumUrl, config.stratumPort)
+            if (useTls && configRepository.getStratumPin(host) == null) {
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, R.string.security_reminder_defaulting_to_trust, Toast.LENGTH_SHORT).show()
+                }
+            }
+            throttleStateRef.set(ThrottleState(config.maxIntensityPercent, false, 0L, config.gpuUtilizationPercent))
+            engine.start(config)
+            if (!engine.isRunning()) {
+                val err = engine.getStatus().lastError ?: "Mining failed"
+                AppLog.e(LOG_TAG) { "Mining start failed: $err" }
+                Handler(Looper.getMainLooper()).post {
+                    startInProgress.set(false)
+                    if (freshSession) {
+                        val toastText = when (err) {
+                            NativeMiningEngine.SHA256_SELFTEST_LAST_ERROR ->
+                                getString(R.string.mining_start_fail_sha_selftest)
+                            NativeMiningEngine.GPU_SHA256_SELFTEST_LAST_ERROR ->
+                                getString(R.string.mining_start_fail_gpu_sha_selftest)
+                            NativeMiningEngine.BOTH_HASHERS_DISABLED_LAST_ERROR ->
+                                getString(R.string.mining_start_fail_both_hashers_disabled)
+                            NativeMiningEngine.NO_HASHING_BACKEND_LAST_ERROR ->
+                                getString(R.string.mining_failed_no_hashing_backend)
+                            else -> getString(R.string.mining_failed, err)
+                        }
+                        Toast.makeText(applicationContext, toastText, Toast.LENGTH_LONG).show()
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    } else {
+                        scheduleWatchdog()
+                    }
+                }
+                return@Thread
+            }
+            Handler(Looper.getMainLooper()).post {
+                if (freshSession) {
+                    statsRepository.clearHeatStopForNewSession()
+                    statsRepository.clearResumeStateForNewSession()
+                    statsRepository.clearChartSnapshot()
+                    statsRepository.clearThermalChartState()
+                    statsRepository.clearMiningTimeCheckpoint()
+                    sessionAccumulatedHashedMs = 0L
+                    lastChartSnapshotSaveMs = 0L
+                    lastMiningTimeCheckpointSaveMs = 0L
+                    lastThermalReadMs = 0L
+                    recordShareSessionBaselines()
+                    beginHashingClock(0L)
+                    statsRepository.setMiningRequested(true)
+                } else {
+                    lastThermalReadMs = 0L
+                    beginHashingClock(sessionAccumulatedHashedMs)
+                }
+                val c = configRepository.getConfig()
+                if (c.autoTuningByBatteryTemp) {
+                    autoTuningThrottleSleepMs = AUTO_TUNING_DEFAULT_SLEEP_MS
+                    autoTuningDirection = AUTO_TUNING_DIRECTION_NONE
+                }
+                if (c.cpuUsageTargetPercent != null) {
+                    cpuThrottleSleepMs = 0L
+                    lastCpuThrottleActive = false
+                    synchronized(cpuUtilizationSamples) { cpuUtilizationSamples.clear() }
+                }
+                throttleStateRef.set(ThrottleState(c.maxIntensityPercent, false, 0L, c.gpuUtilizationPercent))
+                lastBatteryThrottleActive = false
+                lastHashrateThrottleActive = false
+                if (c.usePartialWakeLock) {
+                    when {
+                        c.alarmWakeIntervalSec == 0 -> acquireWakeLock()
+                        c.alarmWakeIntervalSec in 1..MiningConfig.ALARM_WAKE_INTERVAL_SEC_MAX -> scheduleAlarm(c.alarmWakeIntervalSec, c.useLegacyAlarm)
+                        else -> { }
+                    }
+                }
+                scheduleWatchdog()
+                if (freshSession) {
+                    Toast.makeText(applicationContext, getString(R.string.mining_started), Toast.LENGTH_SHORT).show()
+                }
+                registerConstraintReceiver()
+                throttleThreadRunning.set(true)
+                lastCpuJiffiesFailureLogMs = 0L
+                throttleThread = Thread { runThrottleLoop() }.apply { isDaemon = true; start() }
+                handler.post(sampleRunnable)
+                handler.postDelayed(saveStatsRunnable, STATS_SAVE_INTERVAL_MS)
+                startInProgress.set(false)
+            }
+        }.start()
+    }
+
+    private fun stopThrottleThread() {
+        throttleThreadRunning.set(false)
+        throttleThread?.interrupt()
+        throttleThread = null
+    }
+
+    private fun restartMining() {
+        AppLog.d(LOG_TAG) { "restartMining()" }
+        if (!engine.isRunning()) return
+        handler.removeCallbacks(sampleRunnable)
+        handler.removeCallbacks(saveStatsRunnable)
+        stopThrottleThread()
+        synchronized(hashrateHistoryLock) {
+            hashrateHistoryCpu.clear()
+            hashrateHistoryGpu.clear()
+            hashrateHistoryElapsedSec.clear()
+            batteryTempHistoryCelsius.clear()
+            clearTelemetryHistoryLocked()
+        }
+        unregisterConstraintReceiver()
+        cancelAlarm()
+        releaseWakeLock()
+        engine.stop()
+        Thread {
+            val config = configRepository.getConfig()
+            if (!config.isValidForMining() || !MiningConstraints.canStartMining(this@MiningForegroundService, config)) {
+                Handler(Looper.getMainLooper()).post { stopMining() }
+                return@Thread
+            }
+            val host = StratumPinCapture.normalizeHost(config.stratumUrl)
+            val useTls = StratumPinCapture.indicatesTls(config.stratumUrl, config.stratumPort)
+            if (useTls && configRepository.getStratumPin(host) == null) {
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, R.string.security_reminder_defaulting_to_trust, Toast.LENGTH_SHORT).show()
+                }
+            }
+            throttleStateRef.set(ThrottleState(config.maxIntensityPercent, false, 0L, config.gpuUtilizationPercent))
+            engine.start(config)
+            if (!engine.isRunning()) {
+                Handler(Looper.getMainLooper()).post { stopMining() }
+                return@Thread
+            }
+            Handler(Looper.getMainLooper()).post {
+                val now = System.currentTimeMillis()
+                hashingSegmentStartMs?.let { seg ->
+                    statsRepository.addTotalMiningTimeMs((now - seg).coerceAtLeast(0L))
+                }
+                statsRepository.clearMiningTimeCheckpoint()
+                statsRepository.clearChartSnapshot()
+                statsRepository.clearThermalChartState()
+                lastChartSnapshotSaveMs = 0L
+                lastMiningTimeCheckpointSaveMs = 0L
+                lastThermalReadMs = 0L
+                recordShareSessionBaselines()
+                beginHashingClock(0L)
+                val c = configRepository.getConfig()
+                if (c.autoTuningByBatteryTemp) {
+                    autoTuningThrottleSleepMs = AUTO_TUNING_DEFAULT_SLEEP_MS
+                    autoTuningDirection = AUTO_TUNING_DIRECTION_NONE
+                }
+                if (c.cpuUsageTargetPercent != null) {
+                    cpuThrottleSleepMs = 0L
+                    lastCpuThrottleActive = false
+                    synchronized(cpuUtilizationSamples) { cpuUtilizationSamples.clear() }
+                }
+                throttleStateRef.set(ThrottleState(c.maxIntensityPercent, false, 0L, c.gpuUtilizationPercent))
+                lastBatteryThrottleActive = false
+                lastHashrateThrottleActive = false
+                if (c.usePartialWakeLock) {
+                    when {
+                        c.alarmWakeIntervalSec == 0 -> acquireWakeLock()
+                        c.alarmWakeIntervalSec in 1..MiningConfig.ALARM_WAKE_INTERVAL_SEC_MAX -> scheduleAlarm(c.alarmWakeIntervalSec, c.useLegacyAlarm)
+                        else -> { }
+                    }
+                }
+                scheduleWatchdog()
+                Toast.makeText(applicationContext, getString(R.string.mining_restarted), Toast.LENGTH_SHORT).show()
+                registerConstraintReceiver()
+                throttleThreadRunning.set(true)
+                lastCpuJiffiesFailureLogMs = 0L
+                throttleThread = Thread { runThrottleLoop() }.apply { isDaemon = true; start() }
+                handler.post(sampleRunnable)
+                handler.postDelayed(saveStatsRunnable, STATS_SAVE_INTERVAL_MS)
+            }
+        }.start()
+    }
+
+    private fun registerConstraintReceiver() {
+        if (constraintReceiver != null) return
+        constraintReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val config = configRepository.getConfig()
+                if (!engine.isRunning()) return
+                if (MiningConstraints.canStartMining(this@MiningForegroundService, config)) return
+                // Allow offline mining: do not stop when the only failing constraint is network.
+                val onlyNetworkGone = config.isValidForMining() &&
+                    MiningConstraints.isChargingOk(this@MiningForegroundService, config) &&
+                    !MiningConstraints.isNetworkOk(this@MiningForegroundService, config)
+                if (!onlyNetworkGone) stopMining()
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Context.RECEIVER_NOT_EXPORTED
+        } else {
+            @Suppress("InlinedApi") 0
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            registerReceiver(constraintReceiver, filter, flags)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(constraintReceiver, filter)
+        }
+    }
+
+    private fun unregisterConstraintReceiver() {
+        constraintReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) { }
+            constraintReceiver = null
+        }
+    }
+
+    private fun acquireWakeLock() {
+        synchronized(wakeLockLock) {
+            wakeLockRefCount++
+            if (wakeLockRefCount == 1) {
+                wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "btcminer:wake").apply { acquire() }
+            }
+        }
+    }
+
+    private fun releaseWakeLock() {
+        synchronized(wakeLockLock) {
+            if (wakeLockRefCount > 0) {
+                wakeLockRefCount--
+            }
+            if (wakeLockRefCount == 0) {
+                try {
+                    wakeLock?.let { if (it.isHeld) it.release() }
+                } catch (_: Exception) { }
+                wakeLock = null
+            }
+        }
+    }
+
+    private fun scheduleAlarm(intervalSec: Int, useLegacyAlarm: Boolean) {
+        val intervalMs = (intervalSec * 1000).toLong()
+        val pending = PendingIntent.getBroadcast(
+            this,
+            0,
+            Intent(ACTION_ALARM_WAKEUP).setPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        alarmPendingIntent = pending
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        if (useLegacyAlarm) {
+            val triggerAt = SystemClock.elapsedRealtime() + 1000L
+            alarmManager.setRepeating(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                triggerAt,
+                intervalMs,
+                pending
+            )
+        } else {
+            val triggerAt = SystemClock.elapsedRealtime() + intervalMs
+            if (Build.VERSION.SDK_INT >= VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    triggerAt,
+                    pending
+                )
+            } else if (Build.VERSION.SDK_INT >= VERSION_CODES.KITKAT) {
+                @Suppress("DEPRECATION")
+                alarmManager.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pending)
+            } else {
+                alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pending)
+            }
+        }
+    }
+
+    private fun cancelAlarm() {
+        alarmPendingIntent?.let { pi ->
+            (getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(pi)
+            alarmPendingIntent = null
+        }
+    }
+
+    private fun scheduleWatchdog() {
+        val pending = PendingIntent.getBroadcast(
+            this,
+            WATCHDOG_REQUEST_CODE,
+            Intent(ACTION_WATCHDOG).setPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        watchdogPendingIntent = pending
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val triggerAt = SystemClock.elapsedRealtime() + MiningConstants.PROCESS_RESUME_WATCHDOG_INTERVAL_MS
+        if (Build.VERSION.SDK_INT >= VERSION_CODES.M) {
+            alarmManager.setExactAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                triggerAt,
+                pending,
+            )
+        } else if (Build.VERSION.SDK_INT >= VERSION_CODES.KITKAT) {
+            @Suppress("DEPRECATION")
+            alarmManager.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pending)
+        } else {
+            alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pending)
+        }
+    }
+
+    private fun cancelWatchdog() {
+        watchdogPendingIntent?.let { pi ->
+            (getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(pi)
+            watchdogPendingIntent = null
+        }
+    }
+
+    private fun currentHashedElapsedMs(): Long {
+        val extra = hashingSegmentStartMs?.let { (System.currentTimeMillis() - it).coerceAtLeast(0L) } ?: 0L
+        return sessionAccumulatedHashedMs + extra
+    }
+
+    private fun beginHashingClock(accumulatedMs: Long) {
+        sessionAccumulatedHashedMs = accumulatedMs.coerceAtLeast(0L)
+        val now = System.currentTimeMillis()
+        hashingSegmentStartMs = now
+        miningStartTimeMillis = now - sessionAccumulatedHashedMs
+        statsRepository.saveSessionAccumulatedHashedMs(sessionAccumulatedHashedMs)
+        statsRepository.saveLastRunDuration(sessionAccumulatedHashedMs)
+    }
+
+    private fun freezeHashedClock() {
+        val hashed = currentHashedElapsedMs()
+        sessionAccumulatedHashedMs = hashed
+        statsRepository.saveSessionAccumulatedHashedMs(hashed)
+        if (hashed > 0L) statsRepository.saveLastRunDuration(hashed)
+        hashingSegmentStartMs = null
+        miningStartTimeMillis = null
+    }
+
+    private fun restoreChartSnapshotIfPresent() {
+        val snap = statsRepository.getChartSnapshotOrNull() ?: return
+        synchronized(hashrateHistoryLock) {
+            hashrateHistoryCpu.clear()
+            hashrateHistoryCpu.addAll(snap.cpu.map { it.toDouble() })
+            hashrateHistoryGpu.clear()
+            hashrateHistoryGpu.addAll(snap.gpu.map { it.toDouble() })
+            hashrateHistoryElapsedSec.clear()
+            hashrateHistoryElapsedSec.addAll(snap.elapsedSec)
+            batteryTempHistoryCelsius.clear()
+            batteryTempHistoryCelsius.addAll(snap.batteryTempC)
+            telemetryHistoryCpussAvgC.clear()
+            telemetryHistoryCpussAvgC.addAll(snap.cpussAvgC)
+            telemetryHistoryCpuAvgC.clear()
+            telemetryHistoryCpuAvgC.addAll(snap.cpuAvgC)
+            telemetryHistoryGpussAvgC.clear()
+            telemetryHistoryGpussAvgC.addAll(snap.gpussAvgC)
+            telemetryHistoryGpuAvgC.clear()
+            telemetryHistoryGpuAvgC.addAll(snap.gpuAvgC)
+            telemetryHistorySkinC.clear()
+            telemetryHistorySkinC.addAll(snap.skinC)
+            telemetryHistoryBatteryAvgC.clear()
+            telemetryHistoryBatteryAvgC.addAll(snap.telemetryBatteryAvgC)
+            telemetryHistoryCpuClkMhz.clear()
+            telemetryHistoryCpuClkMhz.addAll(snap.cpuClkMhz)
+            telemetryHistoryGpuClkMhz.clear()
+            telemetryHistoryGpuClkMhz.addAll(snap.gpuClkMhz)
+            telemetryHistoryAvgWorkMs.clear()
+            telemetryHistoryAvgWorkMs.addAll(snap.avgWorkMs)
+        }
+    }
+
+    /**
+     * Session-end average for lifetime stats: mean of per-chunk averages (~10 min of samples at ~1 Hz).
+     * If [history] is empty, uses [fallbackHs] once when above [MiningStatsRepository.LIFETIME_HASHRATE_EPSILON].
+     */
+    private fun sessionAverageHashrateForLifetime(history: List<Double>, fallbackHs: Double): Double {
+        if (history.isNotEmpty()) {
+            val chunk = LIFETIME_SESSION_AVG_CHUNK_SAMPLES
+            if (history.size <= chunk) return history.average()
+            val chunkAvgs = mutableListOf<Double>()
+            var i = 0
+            while (i + chunk <= history.size) {
+                chunkAvgs.add(history.subList(i, i + chunk).average())
+                i += chunk
+            }
+            if (i < history.size) {
+                chunkAvgs.add(history.subList(i, history.size).average())
+            }
+            return chunkAvgs.average()
+        }
+        return if (kotlin.math.abs(fallbackHs) > MiningStatsRepository.LIFETIME_HASHRATE_EPSILON) fallbackHs else 0.0
+    }
+
+    /**
+     * Persists this session's nonces and sum-of-session-average CPU/GPU hash rates.
+     * Must run while [engine] status and hashrate histories are still meaningful, **before** histories are cleared.
+     *
+     * Process kill / crash may skip this — acceptable per product note.
+     */
+    private fun finalizeLifetimeStatsForEndedSession() {
+        val status = engine.getStatus()
+        val cpuHist = synchronized(hashrateHistoryLock) { hashrateHistoryCpu.toList() }
+        val gpuHist = synchronized(hashrateHistoryLock) { hashrateHistoryGpu.toList() }
+        val avgCpu = sessionAverageHashrateForLifetime(cpuHist, status.hashrateHs)
+        val avgGpu = sessionAverageHashrateForLifetime(
+            gpuHist,
+            if (status.gpuAvailable) status.gpuHashrateHs else 0.0,
+        )
+        statsRepository.addLifetimeSessionContribution(status.noncesScanned, avgCpu, avgGpu)
+    }
+
+    /**
+     * Saves last-run duration, page-1 idle snapshots, cumulative total mining time, optional heat-stop snapshot;
+     * clears [miningStartTimeMillis]. No-op if not in a timed session.
+     */
+    private fun persistSessionWallClockSnapshotsAndTotal(heatStop: Boolean, heatStopTempC: Float?) {
+        val hashed = currentHashedElapsedMs()
+        val segmentStart = hashingSegmentStartMs
+        val now = System.currentTimeMillis()
+        val hadClock = miningStartTimeMillis != null || segmentStart != null || hashed > 0L
+        if (!hadClock) {
+            statsRepository.setMiningRequested(false)
+            cancelWatchdog()
+            return
+        }
+        val segmentDelta = segmentStart?.let { (now - it).coerceAtLeast(0L) } ?: 0L
+        val virtualStart = miningStartTimeMillis ?: (now - hashed)
+        val s = engine.getStatus()
+        val acc = (s.acceptedShares - sessionBaselineAcceptedShares).coerceAtLeast(0L)
+        val rej = (s.rejectedShares - sessionBaselineRejectedShares).coerceAtLeast(0L)
+        val idf = (s.identifiedShares - sessionBaselineIdentifiedShares).coerceAtLeast(0L)
+        val blockDelta = (s.blockTemplates - sessionBaselineBlockTemplates).coerceAtLeast(0L)
+        statsRepository.saveLastRunDuration(hashed)
+        statsRepository.addTotalMiningTimeMs(segmentDelta)
+        statsRepository.saveLastStoppedSessionShareDisplay(acc, rej, idf)
+        statsRepository.saveLastStoppedSessionBestBlockDisplay(engine.getSessionBestShareDifficulty(), blockDelta)
+        statsRepository.saveLastStoppedSessionStartWallMs(virtualStart)
+        if (heatStop && heatStopTempC != null) {
+            statsRepository.setHeatStopSnapshot(hashed, heatStopTempC)
+        }
+        statsRepository.clearMiningTimeCheckpoint()
+        statsRepository.saveSessionAccumulatedHashedMs(0L)
+        statsRepository.setMiningRequested(false)
+        cancelWatchdog()
+        sessionAccumulatedHashedMs = 0L
+        hashingSegmentStartMs = null
+        miningStartTimeMillis = null
+    }
+
+    private fun maybePersistRuntimeSnapshots(force: Boolean) {
+        val start = hashingSegmentStartMs ?: return
+        val now = System.currentTimeMillis()
+
+        if (force || now - lastMiningTimeCheckpointSaveMs >= MINING_TIME_CHECKPOINT_INTERVAL_MS) {
+            statsRepository.saveMiningTimeCheckpoint(start, now)
+            lastMiningTimeCheckpointSaveMs = now
+        }
+
+        if (force || now - lastChartSnapshotSaveMs >= CHART_SNAPSHOT_SAVE_INTERVAL_MS) {
+            val cpuHist: List<Double>
+            val gpuHist: List<Double>
+            val elapsedHist: List<Float>
+            val battHist: List<Float>
+            val cpussHist: List<Float>
+            val cpuAvgHist: List<Float>
+            val gpussHist: List<Float>
+            val gpuAvgHist: List<Float>
+            val skinHist: List<Float>
+            val telemetryBattHist: List<Float>
+            val cpuClkHist: List<Float>
+            val gpuClkHist: List<Float>
+            val avgWorkMsHist: List<Float>
+            synchronized(hashrateHistoryLock) {
+                cpuHist = hashrateHistoryCpu.toList()
+                gpuHist = hashrateHistoryGpu.toList()
+                elapsedHist = hashrateHistoryElapsedSec.toList()
+                battHist = batteryTempHistoryCelsius.toList()
+                cpussHist = telemetryHistoryCpussAvgC.toList()
+                cpuAvgHist = telemetryHistoryCpuAvgC.toList()
+                gpussHist = telemetryHistoryGpussAvgC.toList()
+                gpuAvgHist = telemetryHistoryGpuAvgC.toList()
+                skinHist = telemetryHistorySkinC.toList()
+                telemetryBattHist = telemetryHistoryBatteryAvgC.toList()
+                cpuClkHist = telemetryHistoryCpuClkMhz.toList()
+                gpuClkHist = telemetryHistoryGpuClkMhz.toList()
+                avgWorkMsHist = telemetryHistoryAvgWorkMs.toList()
+            }
+            if (cpuHist.isNotEmpty() && gpuHist.isNotEmpty() && elapsedHist.isNotEmpty() && battHist.isNotEmpty()) {
+                val src = getSessionIdentifiedShareSourceCounts()
+                statsRepository.saveChartSnapshot(
+                    cpu = cpuHist,
+                    gpu = gpuHist,
+                    elapsedSec = elapsedHist,
+                    batteryTempC = battHist,
+                    donutCpuShares = src.first,
+                    donutGpuShares = src.second,
+                    sessionStartMs = miningStartTimeMillis ?: start,
+                    savedAtMs = now,
+                    cpussAvgC = cpussHist,
+                    cpuAvgC = cpuAvgHist,
+                    gpussAvgC = gpussHist,
+                    gpuAvgC = gpuAvgHist,
+                    skinC = skinHist,
+                    telemetryBatteryAvgC = telemetryBattHist,
+                    cpuClkMhz = cpuClkHist,
+                    gpuClkMhz = gpuClkHist,
+                    avgWorkMs = avgWorkMsHist,
+                )
+                lastChartSnapshotSaveMs = now
+            }
+        }
+    }
+
+    private fun tearDownMiningEngineAndHistories() {
+        cancelAlarm()
+        releaseWakeLock()
+        handler.removeCallbacks(sampleRunnable)
+        handler.removeCallbacks(saveStatsRunnable)
+        stopThrottleThread()
+        finalizeLifetimeStatsForEndedSession()
+        statsRepository.save(engine.getStatus())
+        synchronized(hashrateHistoryLock) {
+            hashrateHistoryCpu.clear()
+            hashrateHistoryGpu.clear()
+            hashrateHistoryElapsedSec.clear()
+            batteryTempHistoryCelsius.clear()
+            clearTelemetryHistoryLocked()
+        }
+        unregisterConstraintReceiver()
+        engine.stop()
+    }
+
+    private fun clearTelemetryHistoryLocked() {
+        telemetryHistoryCpussAvgC.clear()
+        telemetryHistoryCpuAvgC.clear()
+        telemetryHistoryGpussAvgC.clear()
+        telemetryHistoryGpuAvgC.clear()
+        telemetryHistorySkinC.clear()
+        telemetryHistoryBatteryAvgC.clear()
+        telemetryHistoryCpuClkMhz.clear()
+        telemetryHistoryGpuClkMhz.clear()
+        telemetryHistoryAvgWorkMs.clear()
+    }
+
+    private fun shutdownSessionDueToBatteryOverheat(tempAtStopC: Float) {
+        AppLog.d(LOG_TAG) { "shutdownSessionDueToBatteryOverheat temp=${tempAtStopC}C" }
+        maybePersistRuntimeSnapshots(force = true)
+        persistSessionWallClockSnapshotsAndTotal(heatStop = true, heatStopTempC = tempAtStopC)
+        setOverheatBannerFlag(true)
+        showOverheatNotification()
+        val ts = throttleStateRef.get()
+        throttleStateRef.set(
+            ThrottleState(
+                ts.effectiveIntensityPercent,
+                stopDueToOverheat = true,
+                throttleSleepMs = ts.throttleSleepMs,
+                effectiveGpuUtilizationPercent = ts.effectiveGpuUtilizationPercent,
+            ),
+        )
+        NativeMiner.gpuRequestInterrupt()
+        NativeMiner.cpuRequestInterrupt()
+        tearDownMiningEngineAndHistories()
+        Toast.makeText(applicationContext, R.string.battery_too_hot_toast, Toast.LENGTH_LONG).show()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun stopMining() {
+        AppLog.d(LOG_TAG) { "stopMining()" }
+        maybePersistRuntimeSnapshots(force = true)
+        persistSessionWallClockSnapshotsAndTotal(heatStop = false, heatStopTempC = null)
+        tearDownMiningEngineAndHistories()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /** Builds a notification without touching [engine]. Use for first startForeground() to avoid timeout. */
+    private fun createMinimalNotification(): Notification {
+        createNotificationChannel()
+        val open = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.mining_notification_title))
+            .setContentText(getString(R.string.mining_notification_text))
+            .setSmallIcon(R.drawable.ic_mining_notification)
+            .setContentIntent(open)
+            .setOngoing(true)
+            .build()
+    }
+
+    /** Builds mining notification with given content text. Safe to call from background thread. */
+    private fun buildNotification(contentText: String): Notification {
+        createNotificationChannel()
+        val open = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.mining_notification_title))
+            .setContentText(contentText)
+            .setSmallIcon(R.drawable.ic_mining_notification)
+            .setContentIntent(open)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.mining_notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW
+            ).apply { setShowBadge(false) }
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+            val redirectChannel = NotificationChannel(
+                REDIRECT_CHANNEL_ID,
+                getString(R.string.pool_redirect_notification_title),
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply { setShowBadge(false) }
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(redirectChannel)
+            val overheatChannel = NotificationChannel(
+                OVERHEAT_CHANNEL_ID,
+                getString(R.string.overheat_notification_title),
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply { setShowBadge(true) }
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(overheatChannel)
+        }
+    }
+
+    private fun setOverheatBannerFlag(show: Boolean) {
+        getSharedPreferences(OVERHEAT_BANNER_PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_SHOW_OVERHEAT_BANNER, show).apply()
+    }
+
+    /** Shows a persistent, user-dismissible notification when mining stops due to overheat. */
+    private fun showOverheatNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            createNotificationChannel()
+        }
+        val open = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, OVERHEAT_CHANNEL_ID)
+            .setContentTitle(getString(R.string.overheat_notification_title))
+            .setContentText(getString(R.string.overheat_notification_body, MiningConfig.BATTERY_TEMP_HARD_STOP_C))
+            .setSmallIcon(R.drawable.ic_mining_notification)
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(OVERHEAT_NOTIFICATION_ID, notification)
+    }
+
+    /** Shows a persistent, user-dismissible notification when the pool sends client.reconnect (redirect not applied). */
+    private fun showPoolRedirectNotification(host: String, port: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            createNotificationChannel()
+        }
+        val open = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, REDIRECT_CHANNEL_ID)
+            .setContentTitle(getString(R.string.pool_redirect_notification_title))
+            .setContentText(getString(R.string.pool_redirect_notification_text, host, port))
+            .setSmallIcon(R.drawable.ic_mining_notification)
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(REDIRECT_NOTIFICATION_ID, notification)
+    }
+
+    companion object {
+        /** Sleep duration (ms) after each chunk when battery or hashrate throttle is active. Adjust for testing. */
+        const val THROTTLE_SLEEP_MS = 240_000L //120_000L //60_000L
+        /** Per-second increase (ms) when temp in 95–100% band. */
+        const val AUTO_TUNING_STEP_UP_MS = 1_000L
+        /** Per-second decrease (ms) when temp below 90%; faster recovery. */
+        const val AUTO_TUNING_STEP_DOWN_MS = 5_000L
+        const val AUTO_TUNING_SLEEP_MAX = 240_000L //120_000L //60_000L
+        /** Default throttle sleep (ms) when auto-tuning starts; no persistence. */
+        const val AUTO_TUNING_DEFAULT_SLEEP_MS = 0L // 30_000L
+        /** Fraction of max battery temp for auto-tune band low bound (below this → decrease delay). */
+        const val AUTO_TUNING_TARGET_LO_RATIO: Double = 0.90 // 0.85 //0.70
+        /** Fraction of max battery temp for auto-tune band high bound (above this up to 100% → increase delay). */
+        const val AUTO_TUNING_TARGET_HI_RATIO: Double = 0.95 // 0.90
+        const val AUTO_TUNING_DIRECTION_NONE = 0
+        const val AUTO_TUNING_DIRECTION_DECREASING = 1
+        const val AUTO_TUNING_DIRECTION_INCREASING = 2
+        /** Rolling window (seconds) for CPU utilization %; samples older than this are dropped. */
+        const val CPU_UTILIZATION_ROLLING_WINDOW_SEC = 60
+        private const val STATS_SAVE_INTERVAL_MS = 60_000L
+        private const val CHART_SNAPSHOT_SAVE_INTERVAL_MS = 10_000L
+        private const val THERMAL_READ_INTERVAL_MS = 5_000L
+        private const val MINING_TIME_CHECKPOINT_INTERVAL_MS = 10_000L
+        /** ~1 dashboard sample/s; chunk session averages into ~10 min segments, then mean of chunk means. */
+        private const val LIFETIME_SESSION_AVG_CHUNK_SAMPLES = 10 * 60
+        private const val LOG_TAG = "Mining"
+        const val ACTION_START = "com.btcminer.android.mining.START"
+        const val ACTION_RESUME = "com.btcminer.android.mining.RESUME"
+        const val ACTION_STOP = "com.btcminer.android.mining.STOP"
+        const val ACTION_RESTART = "com.btcminer.android.mining.RESTART"
+        const val ACTION_ALARM_WAKEUP = "com.btcminer.android.mining.ALARM_WAKEUP"
+        const val ACTION_WATCHDOG = "com.btcminer.android.mining.WATCHDOG"
+        const val WAKE_LOCK_HOLD_MS = 55_000L
+        private const val WATCHDOG_REQUEST_CODE = 17
+        private const val CHANNEL_ID = "mining"
+        private const val NOTIFICATION_ID = 1
+        private const val REDIRECT_CHANNEL_ID = "pool_redirect"
+        private const val REDIRECT_NOTIFICATION_ID = 2
+        private const val OVERHEAT_CHANNEL_ID = "overheat"
+        private const val OVERHEAT_NOTIFICATION_ID = 3
+        const val OVERHEAT_BANNER_PREFS = "overheat_banner"
+        const val KEY_SHOW_OVERHEAT_BANNER = "show_overheat_stopped_banner"
+
+        @Volatile
+        var gpuRetryUiListener: GpuRetryUiListener? = null
+
+        fun startAsForeground(context: Context, action: String) {
+            val intent = Intent(context, MiningForegroundService::class.java).apply { this.action = action }
+            ContextCompat.startForegroundService(context, intent)
+        }
+    }
+
+    interface GpuRetryUiListener {
+        fun onGpuRetry(attempt: Int)
+        fun onGpuResumed()
+    }
+
+    private fun trimLevelName(level: Int): String = when (level) {
+        ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE -> "RUNNING_MODERATE"
+        ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> "RUNNING_LOW"
+        ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> "RUNNING_CRITICAL"
+        ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> "UI_HIDDEN"
+        ComponentCallbacks2.TRIM_MEMORY_BACKGROUND -> "BACKGROUND"
+        ComponentCallbacks2.TRIM_MEMORY_MODERATE -> "MODERATE"
+        ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> "COMPLETE"
+        else -> "UNKNOWN"
+    }
+}

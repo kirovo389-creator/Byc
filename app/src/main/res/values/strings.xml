@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Byc Bitcoin Miner</string>
+    <string name="dashboard_title">Bitcoin Android Miner</string>
+    <string name="wallet_balance_tor_note">Not available when using TOR / Offline.</string>
+    <string name="wallet_balance_invalid_address">Wallet address is invalid. Check Configuration.</string>
+
+    <!-- Configuration -->
+    <string name="config_title">Configuration</string>
+    <string name="digital_rain_title">Digital Rain</string>
+    <string name="digital_rain_master_switch_label">Digital Rain On/Off</string>
+    <string name="switch_on">On</string>
+    <string name="switch_off">Off</string>
+    <string name="digital_rain_section_render_backend">Renderer</string>
+    <string name="digital_rain_section_glyph_atlas">Glyph atlas</string>
+    <string name="digital_rain_glyph_atlas_mode">Preset</string>
+    <string name="digital_rain_use_opengl_backdrop">OpenGL ES backdrop</string>
+    <string name="digital_rain_gpu_fallback">OpenGL rain failed to start; switched back to Canvas.</string>
+    <string name="mining_config">Mining</string>
+    <string name="digital_rain_config_placeholder">Digital Rain settings — coming soon.</string>
+    <string name="digital_rain_save">Save</string>
+    <string name="digital_rain_restore_defaults">Restore defaults</string>
+    <string name="digital_rain_saved">Digital Rain settings saved.</string>
+    <string name="digital_rain_defaults_restored">Restored default Digital Rain settings.</string>
+    <string name="digital_rain_section_motion">Motion</string>
+    <string name="digital_rain_section_colors">Colors</string>
+    <string name="digital_rain_section_character">Characters</string>
+    <string name="digital_rain_section_depth">Depth</string>
+    <string name="digital_rain_depth_enabled">Enable depth</string>
+    <string name="digital_rain_depth_streak_count">Number of streaks</string>
+    <string name="digital_rain_depth_max_scale_percent">Streak size %</string>
+    <string name="digital_rain_section_key_mode">Key mode</string>
+    <string name="digital_rain_section_reserved">Animation mode &amp; text (reserved)</string>
+    <string name="digital_rain_anim_mode">Animation mode</string>
+    <string name="digital_rain_matrix_frame_ms">Matrix tick interval (ms)</string>
+    <string name="digital_rain_line_len_min">Trail length min</string>
+    <string name="digital_rain_line_len_max">Trail length max</string>
+    <string name="digital_rain_line_speed_min">Speed min</string>
+    <string name="digital_rain_line_speed_max">Speed max</string>
+    <string name="digital_rain_column_y_multiplier">Column Y multiplier</string>
+    <string name="digital_rain_line_width">Column width (px)</string>
+    <string name="digital_rain_letter_height">Letter height (px)</string>
+    <string name="digital_rain_font_scale">Font scale hint</string>
+    <string name="digital_rain_use_big_text">Large glyphs</string>
+    <string name="digital_rain_head_rgb">Head character RGB</string>
+    <string name="digital_rain_rain_rgb">Rain RGB</string>
+    <string name="digital_rain_background_rgb">Background RGB</string>
+    <string name="digital_rain_alphabet_only">Letters only (A–Z / a–z)</string>
+    <string name="digital_rain_ascii_range_1">ASCII range 1 (start / end exclusive)</string>
+    <string name="digital_rain_ascii_range_2">ASCII range 2 (start / end exclusive)</string>
+    <string name="digital_rain_enable_key_mode">Enable random key highlight</string>
+    <string name="digital_rain_sticky_key_highlights">Sticky highlights</string>
+    <string name="digital_rain_key_reset_sec">Key refresh interval (s)</string>
+    <string name="digital_rain_key_length_cols">Key columns (0 = all columns)</string>
+    <string name="digital_rain_bitcoin_orange">Bitcoin Orange</string>
+    <string name="digital_rain_text_frame_ms">TEXT tick interval (ms)</string>
+    <string name="digital_rain_showcase_message">Text / Showcase Message</string>
+
+    <string-array name="digital_rain_glyph_atlas_labels">
+        <item>Matrix</item>
+        <item>Bitcoin vs Fiat</item>
+    </string-array>
+
+    <string-array name="digital_rain_anim_labels">
+        <item>MATRIX</item>
+        <item>TEXT</item>
+        <item>SHOWCASE</item>
+    </string-array>
+    <string name="config_save">Save</string>
+    <string name="config_stratum_url">Pool URL (host)</string>
+    <string name="config_stratum_url_hint">e.g. stratum.example.com</string>
+    <string name="config_stratum_port">Pool port</string>
+    <string name="config_stratum_port_hint">3333</string>
+    <string name="config_stratum_user">Stratum username (wallet.worker)</string>
+    <string name="config_stratum_user_hint">wallet_address.worker_name</string>
+    <string name="config_stratum_pass">Pool password</string>
+    <string name="config_stratum_pass_hint">x or any</string>
+    <string name="config_pin_mining_pool_certificate">Pin Mining Pool Certificate</string>
+    <string name="config_bitcoin_address">Bitcoin wallet address</string>
+    <string name="config_bitcoin_address_hint">bc1q…</string>
+    <string name="config_invalid_bitcoin_address">Invalid Bitcoin address. Check the wallet field.</string>
+    <string name="config_invalid_stratum_payout_address">Invalid payout address in pool username (part before the dot).</string>
+    <string name="config_lightning_address">Lightning address (optional)</string>
+    <string name="config_lightning_address_hint">user@domain</string>
+    <string name="config_worker_name">Worker name</string>
+    <string name="config_worker_name_hint">android1</string>
+    <string name="config_partial_wake_lock">Partial Wake Lock</string>
+    <string name="config_partial_wake_lock_summary">Keep mining active when screen off or app minimized</string>
+    <string name="config_alarm_wake_interval">Alarm wake interval (s)</string>
+    <string name="config_alarm_wake_interval_summary">0=off, 1–900=repeat every N seconds (up to 15 min). Requires Partial Wake Lock.</string>
+    <string name="config_use_legacy_alarm">Use legacy alarm (less reliable)</string>
+    <string name="config_use_legacy_alarm_summary">Uses setRepeating instead of exact alarms. May be delayed in Doze.</string>
+    <string name="config_battery_optimization_heading">Battery optimization (mining when screen off)</string>
+    <string name="config_request_battery_exemption">Request Don\'t optimize (dialog)</string>
+    <string name="config_open_battery_optimization_settings">Open battery optimization settings</string>
+    <string name="config_battery_already_exempt">App is already set to Don\'t optimize</string>
+    <string name="config_thread_priority">Mining Thread Priority (Max = -8)</string>
+    <string name="config_thread_priority_summary">0=default, -8=highest. Affects CPU time when screen is off.</string>
+    <string name="config_wifi_only">WiFi only</string>
+    <string name="config_wifi_only_summary">Disable mining over mobile data</string>
+    <string name="config_mine_only_when_charging">Mine only when charging</string>
+    <string name="config_mine_only_when_charging_summary">Reduces battery wear</string>
+    <string name="config_battery_temp_fahrenheit">Show battery temp in Fahrenheit</string>
+    <string name="config_battery_temp_fahrenheit_summary">Otherwise Celsius</string>
+    <string name="config_battery_temp_throttle">Max battery temp (°C)</string>
+    <string name="config_battery_temp_throttle_summary">Throttle mining above this; resume when 10% below. Max 45°C.</string>
+    <string name="config_auto_tuning_battery_temp">Auto-Tuning by Battery Temp</string>
+    <string name="config_auto_tuning_battery_temp_summary">Adjust throttle sleep to keep temp in target band (Max −10% to Max). Steps of 5 s; resets to 60 s if over Max.</string>
+    <string name="config_hashrate_target">Hashrate target (H/s)</string>
+    <string name="config_hashrate_target_hint">e.g. 100. Leave empty for no throttle</string>
+    <string name="config_cpu_usage_target">CPU usage target (%)</string>
+    <string name="config_cpu_usage_target_hint">e.g. 1. Leave empty for no throttle. App %% of total CPU. Requires device root access.</string>
+    <string name="battery_too_hot_toast">Overheat Detected: Mining Stopped !</string>
+    <string name="overheat_notification_title">Mining stopped</string>
+    <string name="overheat_notification_body">Overheat detected. Battery reached %1$d°C.</string>
+    <string name="overheat_banner_message">Mining was stopped due to overheat</string>
+    <string name="overheat_banner_dismiss">Dismiss</string>
+    <string name="config_cores_used">CPU Cores</string>
+    <string name="config_cores_used_summary">Number of CPU cores used for mining (0 = CPU off, GPU-only if GPU enabled; 1 = single thread; can throttle with intensity below)</string>
+    <string name="config_max_intensity">Max CPU intensity (%)</string>
+    <string name="config_max_intensity_summary">0–100 (0=10 min delay, 100=no delay)</string>
+    <string name="config_gpu_section">GPU</string>
+    <string name="config_gpu_enabled">GPU Enabled</string>
+    <string name="config_gpu_enabled_summary">Turn GPU mining on or off</string>
+    <string name="config_gpu_local_size_x">GPU local_size_x (Threads)</string>
+    <string name="config_gpu_local_size_x_summary">Threads per workgroup (not dispatch count). Dispatch group count is computed automatically.</string>
+    <string name="config_gpu_local_size_x_value">%1$d threads/workgroup</string>
+    <string name="config_gpu_local_size_max">Device max: %1$d</string>
+    <string name="config_gpu_hashes_per_thread">GPU hash per thread</string>
+    <string name="config_gpu_hashes_per_thread_summary">Scalar hashes each GPU thread runs per invocation (1–8). Save and restart mining to apply. Higher values may help Mali/Adreno or reduce occupancy.</string>
+    <string name="config_gpu_hashes_per_thread_value">%1$d hash(es)/thread</string>
+    <string name="config_gpu_vulkan_unavailable">Vulkan unavailable on this device</string>
+    <string name="config_gpu_utilization">Max GPU Intensity (%)</string>
+    <string name="config_gpu_utilization_summary">0–100 (0=10 min delay, 100=no delay)</string>
+    <string name="config_status_update_interval">Status update interval (ms)</string>
+    <string name="config_status_update_interval_summary">Update hashrate every X ms (dashboard)</string>
+    <string name="config_saved">Configuration saved</string>
+    <string name="config_cpu_sha_section">CPU SHA-256 (nonce hashing)</string>
+    <string name="config_cpu_sha_hw_mid">ARM SHA2 + midstate</string>
+    <string name="config_cpu_sha_hw">ARM SHA2</string>
+    <string name="config_cpu_sha_neon_mid">NEON 4-way + midstate</string>
+    <string name="config_cpu_sha_neon">NEON 4-way</string>
+    <string name="config_cpu_sha_scalar_mid">Scalar + midstate</string>
+    <string name="config_cpu_sha_scalar">Scalar (compatibility)</string>
+    <string name="config_cpu_sha_unsupported_suffix">\u0020(not on this device)</string>
+    <string name="config_gpu_sha_section">GPU SHA-256 (Vulkan nonce hashing)</string>
+    <string name="config_gpu_sha_full">GPU Full header</string>
+    <string name="config_gpu_sha_midstate">GPU + Midstate</string>
+    <string name="config_gpu_sha_uvec2_midstate">GPU + Midstate (uvec2)</string>
+    <string name="config_gpu_sha_uvec4_midstate">GPU + Midstate (uvec4)</string>
+
+    <!-- Mining service -->
+    <string name="mining_notification_channel_name">Mining</string>
+    <string name="mining_notification_title">BTC Miner</string>
+    <string name="mining_notification_text">Mining active. Tap to open.</string>
+    <string name="mining_reconnecting">Reconnecting…</string>
+    <string name="mining_start">Start mining</string>
+    <string name="mining_stop">Stop mining</string>
+    <string name="mining_start_fail_config">Set pool URL and username in Configuration first.</string>
+    <string name="mining_start_fail_network">No suitable network. Enable WiFi or allow mobile data in Configuration.</string>
+    <string name="mining_start_fail_charging">Mine only when charging is on. Plug in the device to start.</string>
+    <string name="mining_start_fail_both_hashers_disabled">Both CPU and GPU are disabled</string>
+    <string name="mining_failed_no_hashing_backend">No CPU or GPU mining is active (GPU unavailable or disabled while CPU cores are 0).</string>
+    <string name="mining_started">Mining started</string>
+    <string name="mining_restarted">Mining restarted with new settings</string>
+    <string name="mining_failed">Mining failed: %s</string>
+    <string name="mining_start_fail_sha_selftest">Mining failed: CPU SHA-256 self-test did not match the reference implementation. Try Scalar or reinstall the app.</string>
+    <string name="mining_start_fail_gpu_sha_selftest">Mining failed: GPU SHA-256 self-test did not match (host or Vulkan readback). Try GPU full header, GPU midstate, GPU uvec2 midstate, GPU uvec4 midstate, update GPU drivers, or turn off GPU mining.</string>
+    <string name="gpu_not_available">GPU not available</string>
+    <string name="pool_redirect_notification_title">Pool requested redirect</string>
+    <string name="pool_redirect_notification_text">Pool requested redirect to %1$s:%2$d (not applied). Dismiss when done.</string>
+
+    <!-- Dashboard stats -->
+    <string name="hash_chart_title_2min">2 min</string>
+    <string name="hash_chart_title_10min">10 min</string>
+    <string name="hash_chart_title_session">Session</string>
+    <string name="hash_chart_a11y_toggle_hint">Hash rate chart. Tap to cycle between 2 minute, 10 minute, and session history.</string>
+    <string name="telemetry_chart_title_2min">2 min</string>
+    <string name="telemetry_chart_title_10min">10 min</string>
+    <string name="telemetry_chart_title_session">Session</string>
+    <string name="telemetry_chart_no_sensors">Telemetry Sensor data not available on device.</string>
+    <string name="telemetry_chart_a11y_toggle_hint">Telemetry chart. Tap to cycle between 2 minute, 10 minute, and session history.</string>
+    <string name="best_difficulty_chart_title_lifetime">History</string>
+    <string name="best_difficulty_chart_title_session">Session</string>
+    <string name="best_difficulty_chart_legend_all">All time</string>
+    <string name="best_difficulty_chart_legend_session">This session</string>
+    <string name="best_difficulty_chart_a11y_toggle_hint">Best difficulty chart. Tap to switch between history (event order, wall-clock gaps not shown) and this session (improvements in order).</string>
+    <string name="mandelbrot_chart_placeholder">Mandelbrot art appears when session best difficulty improves while mining.</string>
+    <string name="fractal_chart_caption_pattern">%1$s · tap to cycle</string>
+    <string name="fractal_name_mandelbrot">Mandelbrot</string>
+    <string name="fractal_name_julia">Julia</string>
+    <string name="fractal_name_burning_ship">Burning Ship</string>
+    <string name="fractal_name_multibrot">Multibrot</string>
+    <string name="fractal_name_tricorn">Tricorn</string>
+    <string name="fractal_name_phoenix">Phoenix</string>
+    <string name="fractal_name_newton">Newton</string>
+    <string name="mandelbrot_chart_image_a11y">Mandelbrot image from session best difficulty; updates when session best increases during mining.</string>
+    <string name="fractal_chart_image_a11y_with_kind">%1$s fractal plot from session best difficulty. Tap to cycle fractal type.</string>
+    <string name="chart_page_indicator_a11y">Chart page %1$d of %2$d</string>
+    <string name="thermal_chart_unavailable">Thermal sensors unavailable</string>
+    <string name="thermal_chart_a11y">Thermal sensor treemap. Tap a cell for sensor details.</string>
+    <string name="thermal_legend_temp_unit">Temp (%1$s)</string>
+    <string name="thermal_legend_cpu">Temp</string>
+    <string name="thermal_legend_gpu">GPU</string>
+    <string name="thermal_legend_batt">BATT</string>
+    <string name="thermal_legend_batt_skin">BATT/Skin</string>
+    <string name="thermal_tooltip_zone">Zone %1$d</string>
+    <string name="shares_donut_cpu_label">CPU</string>
+    <string name="shares_donut_gpu_label">GPU</string>
+    <string name="shares_donut_no_shares">No shares yet</string>
+    <string name="shares_donut_center_value_a11y">Identified shares total %1$d</string>
+    <string name="hash_rate_label">Hash Rate (CPU)</string>
+    <string name="stratum_connection_icon_content_description">Stratum connection status: lit when connected, dim when disconnected</string>
+    <string name="hash_rate_gpu_label">Hash Rate (GPU)</string>
+    <string name="cpu_utilization_label">CPU Util %</string>
+    <string name="stratum_difficulty_label">Stratum Difficulty</string>
+    <string name="nonces_label">Nonces</string>
+    <string name="mining_timer_label">Mining Timer</string>
+    <string name="mining_timer_last_run">Last run</string>
+    <string name="accepted_shares_label">Accepted Shares</string>
+    <string name="rejected_shares_label">Rejected Shares</string>
+    <string name="identified_shares_label">Identified Shares</string>
+    <string name="queued_shares_label">Queued Shares</string>
+    <string name="auto_tune_on">Auto-Tune ON</string>
+    <string name="battery_temp_label">Battery temp</string>
+    <string name="best_difficulty_label">Best difficulty</string>
+    <string name="block_template_label">Block template</string>
+    <string name="dashboard_page4_stratum_input_title">Stratum JSON Response</string>
+    <string name="dashboard_page5_stratum_output_title">Mining JSON Submission</string>
+    <string name="dashboard_page5_stratum_output_title_cpu_share">Mining JSON Submission - CPU Share</string>
+    <string name="dashboard_page5_stratum_output_title_gpu_share">Mining JSON Submission - GPU Share</string>
+    <string name="stratum_json_mining_inactive">Mining inactive</string>
+    <string name="dashboard_page_indicator_a11y">Dashboard page %1$d of %2$d</string>
+
+    <!-- Lifetime stats (dashboard page 2): sum of per-session average hash rates (H/s), not time-weighted. -->
+    <string name="dashboard_panel2_lifetime_shares_title">Lifetime shares (all sessions)</string>
+    <string name="dashboard_panel2_lifetime_records_title">All-time records</string>
+    <string name="dashboard_panel2_network_title">Network</string>
+    <string name="total_mining_time_label">Total mining time</string>
+    <string name="heat_stop_label">Heat stop</string>
+    <string name="heat_stop_default">False</string>
+    <string name="resumed_mining_label">Resumed mining</string>
+    <string name="hash_rate_initializing">Initializing...</string>
+    <string name="gpu_retry_message">GPU init failed, retrying in the background.</string>
+    <string name="gpu_retry_dismiss">Dismiss</string>
+    <string name="gpu_mining_resumed">GPU mining resumed.</string>
+    <string name="network_difficulty_label">Network difficulty</string>
+    <string name="lifetime_total_hash_label">All-time total hash rate (sum of session avgs)</string>
+    <string name="lifetime_total_cpu_hash_label">All-time total CPU hash rate (sum of session avgs)</string>
+    <string name="lifetime_total_gpu_hash_label">All-time total GPU hash rate (sum of session avgs)</string>
+    <string name="lifetime_total_nonces_label">All-time total nonces</string>
+
+    <!-- Reset counters (Config) -->
+    <string name="reset_all_ui_counters">Reset All UI Counters</string>
+    <string name="reset_counters_dialog_title">Reset counters?</string>
+    <string name="reset_counters_dialog_message">Do you want to reset all counters? This includes accepted, rejected, and identified shares, block templates, best difficulty, session nonces, all-time lifetime stats (sum of session-average hash rates and cumulative nonces), and total mining time.</string>
+    <string name="reset_counters_yes">Yes</string>
+    <string name="reset_counters_no">No</string>
+
+    <!-- Stratum / pool certificate pinning -->
+    <string name="security_reminder_defaulting_to_trust">Security Reminder: Defaulting to Trust mode</string>
+    <string name="security_confirmed_pool_cert_verified">Security Confirmed: Mining Pool Certificate verified.</string>
+    <string name="config_pinning_pool_certificate">Pinning pool certificate…</string>
+    <string name="config_could_not_pin_certificate">Could not pin certificate. Check URL and network.</string>
+
+    <!-- Mempool certificate -->
+    <string name="mempool_cert_validated">Mempool Certificate Validated</string>
+    <string name="mempool_cert_invalid">Mempool Certificate Invalid</string>
+</resources>

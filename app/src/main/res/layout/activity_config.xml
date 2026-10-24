@@ -1,0 +1,612 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <ScrollView
+        android:id="@+id/config_scroll"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true"
+        android:padding="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_stratum_url"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/config_stratum_url"
+            app:placeholderText="@string/config_stratum_url_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="textUri"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <CheckBox
+            android:id="@+id/config_pin_this_pool"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_pin_mining_pool_certificate" />
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_stratum_port"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/config_stratum_port"
+            app:placeholderText="@string/config_stratum_port_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_stratum_user"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/config_stratum_user"
+            app:placeholderText="@string/config_stratum_user_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="text"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_stratum_pass"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/config_stratum_pass"
+            app:placeholderText="@string/config_stratum_pass_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="textPassword"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_bitcoin_address"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/config_bitcoin_address"
+            app:placeholderText="@string/config_bitcoin_address_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="text"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_lightning_address"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/config_lightning_address"
+            app:placeholderText="@string/config_lightning_address_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="textEmailAddress"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_worker_name"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/config_worker_name"
+            app:placeholderText="@string/config_worker_name_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="text"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/config_partial_wake_lock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_partial_wake_lock" />
+
+        <TextView
+            android:id="@+id/config_alarm_wake_interval_label"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_alarm_wake_interval"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_alarm_wake_interval"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:valueFrom="0"
+            android:valueTo="60"
+            android:value="60"
+            android:stepSize="1"
+            app:labelBehavior="gone" />
+
+        <TextView
+            android:id="@+id/config_alarm_wake_interval_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="60"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/config_use_legacy_alarm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_use_legacy_alarm" />
+
+        <TextView
+            android:id="@+id/config_battery_optimization_heading"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_battery_optimization_heading"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/config_request_battery_exemption"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_request_battery_exemption" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/config_open_battery_optimization_settings"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/config_open_battery_optimization_settings" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_thread_priority"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_thread_priority"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layoutDirection="rtl"
+            android:valueFrom="-20"
+            android:valueTo="0"
+            android:value="0"
+            android:stepSize="1"
+            app:labelBehavior="gone" />
+
+        <TextView
+            android:id="@+id/config_thread_priority_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="0"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/config_wifi_only"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:checked="true"
+            android:text="@string/config_wifi_only" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/config_mine_only_when_charging"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_mine_only_when_charging" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/config_battery_temp_fahrenheit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_battery_temp_fahrenheit" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_battery_temp_throttle"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_battery_temp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:valueFrom="20"
+            android:valueTo="45"
+            android:value="30"
+            android:stepSize="1"
+            app:labelBehavior="gone" />
+
+        <TextView
+            android:id="@+id/config_battery_temp_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="30 °C"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/config_auto_tuning_battery_temp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:checked="false"
+            android:text="@string/config_auto_tuning_battery_temp" />
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_hashrate_target"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:hint="@string/config_hashrate_target"
+            app:placeholderText="@string/config_hashrate_target_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="numberDecimal"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/config_cpu_usage_target"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:hint="@string/config_cpu_usage_target"
+            app:placeholderText="@string/config_cpu_usage_target_hint">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_cores_used"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_cores"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:valueFrom="0"
+            android:valueTo="8"
+            android:value="1"
+            android:stepSize="1"
+            app:labelBehavior="gone" />
+
+        <TextView
+            android:id="@+id/config_cores_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="1"
+            android:textColor="?attr/colorOnSurface" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_max_intensity"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_intensity"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:valueFrom="0"
+            android:valueTo="100"
+            android:value="75"
+            app:labelBehavior="gone" />
+
+        <TextView
+            android:id="@+id/config_max_intensity_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="75%"
+            android:textColor="?attr/colorOnSurface" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_cpu_sha_section"
+            android:textColor="?attr/colorOnSurface" />
+
+        <RadioGroup
+            android:id="@+id/config_radio_group_cpu_sha"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp">
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_cpu_sha_0"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_cpu_sha_hw_mid" />
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_cpu_sha_1"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_cpu_sha_hw" />
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_cpu_sha_2"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_cpu_sha_neon_mid" />
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_cpu_sha_3"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_cpu_sha_neon" />
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_cpu_sha_4"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_cpu_sha_scalar_mid" />
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_cpu_sha_5"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_cpu_sha_scalar" />
+        </RadioGroup>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_gpu_enabled"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/config_gpu_enabled"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/config_gpu_enabled_summary" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_gpu_local_size_x"
+            android:textColor="?attr/colorOnSurface" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/config_gpu_local_size_x_summary"
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:textColor="?attr/colorOnSurfaceVariant" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_gpu_local_size_x"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:valueFrom="32"
+            android:valueTo="256"
+            android:value="32"
+            android:stepSize="32"
+            app:labelBehavior="gone" />
+
+        <TextView
+            android:id="@+id/config_gpu_local_size_x_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="32 threads/workgroup"
+            android:textColor="?attr/colorOnSurface" />
+
+        <TextView
+            android:id="@+id/config_gpu_local_size_hint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:visibility="gone" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_gpu_hashes_per_thread"
+            android:textColor="?attr/colorOnSurface" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/config_gpu_hashes_per_thread_summary"
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:textColor="?attr/colorOnSurfaceVariant" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_gpu_hashes_per_thread"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:valueFrom="0"
+            android:valueTo="3"
+            android:value="0"
+            android:stepSize="1"
+            app:labelBehavior="gone" />
+
+        <TextView
+            android:id="@+id/config_gpu_hashes_per_thread_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="1 hash(es)/thread"
+            android:textColor="?attr/colorOnSurface" />
+
+        <TextView
+            android:id="@+id/config_gpu_vulkan_unavailable"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/config_gpu_vulkan_unavailable"
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:textColor="?attr/colorError"
+            android:visibility="gone" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_gpu_utilization"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_gpu_utilization"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:valueFrom="0"
+            android:valueTo="100"
+            android:value="75"
+            app:labelBehavior="gone" />
+
+        <TextView
+            android:id="@+id/config_gpu_utilization_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="75%"
+            android:textColor="?attr/colorOnSurface" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_gpu_sha_section"
+            android:textColor="?attr/colorOnSurface" />
+
+        <RadioGroup
+            android:id="@+id/config_radio_group_gpu_sha"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp">
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_gpu_sha_uvec2_mid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_gpu_sha_uvec2_midstate" />
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_gpu_sha_uvec4_mid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_gpu_sha_uvec4_midstate" />
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_gpu_sha_mid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_gpu_sha_midstate" />
+
+            <com.google.android.material.radiobutton.MaterialRadioButton
+                android:id="@+id/config_radio_gpu_sha_full"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/config_gpu_sha_full" />
+        </RadioGroup>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/config_status_update_interval"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/config_slider_status_interval"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:valueFrom="500"
+            android:valueTo="30000"
+            android:value="1000"
+            app:labelBehavior="gone"
+            android:stepSize="500" />
+
+        <TextView
+            android:id="@+id/config_status_interval_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="1000 ms"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/config_reset_counters"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/reset_all_ui_counters" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/config_save"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/config_save" />
+    </LinearLayout>
+    </ScrollView>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/config_save_floating"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:layout_margin="16dp"
+        android:visibility="gone"
+        android:text="@string/config_save" />
+</FrameLayout>

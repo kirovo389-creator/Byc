@@ -1,0 +1,51 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+release/
+
+# Python
+__pycache__/
+*.pyc
+
+# Gradle
+.gradle/
+build/
+
+# Local configuration
+local.properties
+
+# Android Studio
+*.iml
+.idea/
+.DS_Store
+/captures
+.externalNativeBuild
+.cxx
+
+# Keystore (do not commit)
+*.jks
+*.keystore
+
+# Local notes (do not upload)
+MY_COMMANDS.txt
+
+# don't upload logs
+debug-logs/
+phone_logcat.txt
+phone_log.txt
+crash-log.txt
+main-log.txt
+last-crash-log.txt

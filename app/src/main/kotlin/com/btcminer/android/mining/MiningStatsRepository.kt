@@ -1,0 +1,848 @@
+package com.btcminer.android.mining
+
+import android.content.Context
+import android.content.SharedPreferences
+import com.btcminer.android.AppLog
+import com.btcminer.android.util.FractalPlotKind
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlin.math.ceil
+
+/** Loaded from prefs for idle fractal chart restore; see [MiningStatsRepository.saveFractalChartState]. */
+data class PersistedFractalChartState(
+    val sdPrev: Double,
+    val sdNew: Double,
+    val sessionLnAnchor: Double,
+    val sessionLnPeak: Double,
+    val rollingLnMin: Double?,
+    val rollingLnMax: Double?,
+    val fractalPlotOrdinal: Int,
+    val lastPlotKindOrdinal: Int,
+)
+
+/**
+ * Persists five dashboard counters (accepted/rejected/identified shares, best difficulty, block templates)
+ * to a plain SharedPreferences file, separate from the encrypted config vault.
+ * Nonces are not persisted (per-round only). Values are only written when
+ * current is greater than stored (monotonic), except on reset which writes zeros.
+ *
+ * Also persists **lifetime** aggregates (sum of per-session average CPU/GPU hash rates and cumulative
+ * session nonces), updated when a mining session ends; cleared only via [saveZeros].
+ *
+ * **Last stopped session** accepted/rejected/identified (dashboard page 1 while idle): written when
+ * mining stops, cleared when a new session starts or via [saveZeros].
+ *
+ * **Last stopped session** best share difficulty and block-template delta (panel #1 while idle): same lifecycle.
+ *
+ * **Last stopped session** wall start ms (best-difficulty chart Session mode while idle): [saveLastStoppedSessionStartWallMs] /
+ * [clearLastStoppedSessionStartWallMs]; same lifecycle as other last-stopped panel prefs.
+ *
+ * **Total mining time** (wall clock summed across sessions): [addTotalMiningTimeMs], cleared only via [saveZeros].
+ *
+ * **Heat stop** (last 43°C hard stop: session ms + °C at stop): [setHeatStopSnapshot] / [clearHeatStopForNewSession];
+ * not cleared by [saveZeros].
+ *
+ * **Resume / process restart:** [setMiningRequested], [saveSessionAccumulatedHashedMs], [incrementResumeAttemptCount],
+ * share-session baselines. Cleared on user Stop / overheat / charging-constraint stop, or a manual new session.
+ * Resume count is not cleared by [saveZeros].
+ *
+ * **Fractal chart** (idle restore): [saveFractalChartState] / [loadFractalChartState]; cleared by [clearFractalChartState],
+ * [saveZeros], new mining session / Start Mining in UI.
+ *
+ * **Thermal treemap** (idle restore): [saveThermalChartState] / [loadThermalChartState]; cleared by [clearThermalChartState]
+ * and new mining session / Start Mining in UI only (not on stop).
+ */
+class MiningStatsRepository(context: Context) {
+
+    private val appContext: Context = context.applicationContext
+    private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    /**
+     * Reads the five persisted counters and returns them as a [MiningStatus] with [MiningStatus.State.Idle].
+     * Nonces are not persisted; noncesScanned is always 0.
+     */
+    fun get(): MiningStatus {
+        val repoQueued = PendingSharesRepository(appContext).getAll().size.toLong()
+        return MiningStatus(
+            state = MiningStatus.State.Idle,
+            noncesScanned = 0L,
+            acceptedShares = prefs.getLong(KEY_ACCEPTED_SHARES, 0L),
+            rejectedShares = prefs.getLong(KEY_REJECTED_SHARES, 0L),
+            identifiedShares = prefs.getLong(KEY_IDENTIFIED_SHARES, 0L),
+            queuedShares = repoQueued,
+            bestDifficulty = Double.fromBits(prefs.getLong(KEY_BEST_DIFFICULTY, 0L)),
+            blockTemplates = prefs.getLong(KEY_BLOCK_TEMPLATES, 0L),
+        )
+    }
+
+    /**
+     * Saves only counters whose current value is greater than the value on disk.
+     * If no counter has increased, no write is performed.
+     */
+    fun save(status: MiningStatus) {
+        val stored = get()
+        val editor = prefs.edit()
+        var hasChange = false
+
+        if (status.acceptedShares > stored.acceptedShares) {
+            editor.putLong(KEY_ACCEPTED_SHARES, status.acceptedShares)
+            hasChange = true
+        }
+        if (status.rejectedShares > stored.rejectedShares) {
+            editor.putLong(KEY_REJECTED_SHARES, status.rejectedShares)
+            hasChange = true
+        }
+        if (status.identifiedShares > stored.identifiedShares) {
+            editor.putLong(KEY_IDENTIFIED_SHARES, status.identifiedShares)
+            hasChange = true
+        }
+        if (status.bestDifficulty > stored.bestDifficulty) {
+            editor.putLong(KEY_BEST_DIFFICULTY, status.bestDifficulty.toRawBits())
+            hasChange = true
+        }
+        if (status.blockTemplates > stored.blockTemplates) {
+            editor.putLong(KEY_BLOCK_TEMPLATES, status.blockTemplates)
+            hasChange = true
+        }
+
+        if (hasChange) {
+            editor.apply()
+        }
+    }
+
+    /**
+     * Returns the last mining run duration in milliseconds. 0 if never saved.
+     */
+    fun getLastRunDurationMs(): Long = prefs.getLong(KEY_LAST_RUN_DURATION_MS, 0L)
+
+    /**
+     * Saves the last run duration. Called every minute while mining and on stop.
+     * Pass 0 to clear (when user clicks Start Mining).
+     */
+    fun saveLastRunDuration(durationMs: Long) {
+        prefs.edit().putLong(KEY_LAST_RUN_DURATION_MS, durationMs).apply()
+    }
+
+    /** Panel #1 idle display: last session share deltas when mining is not active (survives service destroy). */
+    fun getLastStoppedSessionShareDisplay(): Triple<Long, Long, Long> = Triple(
+        prefs.getLong(KEY_LAST_STOPPED_SESSION_DISPLAY_ACCEPTED, 0L),
+        prefs.getLong(KEY_LAST_STOPPED_SESSION_DISPLAY_REJECTED, 0L),
+        prefs.getLong(KEY_LAST_STOPPED_SESSION_DISPLAY_IDENTIFIED, 0L),
+    )
+
+    fun saveLastStoppedSessionShareDisplay(accepted: Long, rejected: Long, identified: Long) {
+        prefs.edit()
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_ACCEPTED, accepted)
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_REJECTED, rejected)
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_IDENTIFIED, identified)
+            .apply()
+    }
+
+    fun getLastStoppedSessionBestBlockDisplay(): Pair<Double, Long> = Pair(
+        Double.fromBits(prefs.getLong(KEY_LAST_STOPPED_SESSION_DISPLAY_BEST_DIFFICULTY, 0L)),
+        prefs.getLong(KEY_LAST_STOPPED_SESSION_DISPLAY_BLOCK_TEMPLATES_DELTA, 0L),
+    )
+
+    fun saveLastStoppedSessionBestBlockDisplay(bestDifficulty: Double, blockTemplatesDelta: Long) {
+        prefs.edit()
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_BEST_DIFFICULTY, bestDifficulty.toRawBits())
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_BLOCK_TEMPLATES_DELTA, blockTemplatesDelta)
+            .apply()
+    }
+
+    /** Wall-clock session start of the last cleanly ended session; used for Session-mode chart when idle. */
+    fun getLastStoppedSessionStartWallMs(): Long? {
+        val v = prefs.getLong(KEY_LAST_STOPPED_SESSION_START_WALL_MS, 0L)
+        return v.takeIf { it > 0L }
+    }
+
+    fun saveLastStoppedSessionStartWallMs(sessionStartWallMs: Long) {
+        val start = sessionStartWallMs.coerceAtLeast(0L)
+        if (start <= 0L) return
+        prefs.edit().putLong(KEY_LAST_STOPPED_SESSION_START_WALL_MS, start).apply()
+    }
+
+    fun clearLastStoppedSessionStartWallMs() {
+        prefs.edit().remove(KEY_LAST_STOPPED_SESSION_START_WALL_MS).apply()
+    }
+
+    fun getTotalMiningTimeMs(): Long = prefs.getLong(KEY_TOTAL_MINING_TIME_MS, 0L)
+
+    fun addTotalMiningTimeMs(deltaMs: Long) {
+        val d = deltaMs.coerceAtLeast(0L)
+        if (d == 0L) return
+        prefs.edit().putLong(KEY_TOTAL_MINING_TIME_MS, prefs.getLong(KEY_TOTAL_MINING_TIME_MS, 0L) + d).apply()
+    }
+
+    /**
+     * Persists a crash-recoverable mining-time checkpoint for the active session.
+     * This does not mutate [KEY_TOTAL_MINING_TIME_MS]; callers reconcile via [reconcileMiningTimeCheckpoint].
+     */
+    fun saveMiningTimeCheckpoint(sessionStartMs: Long, nowMs: Long = System.currentTimeMillis()) {
+        val start = sessionStartMs.coerceAtLeast(0L)
+        if (start <= 0L) return
+        val baseTotalMs = prefs.getLong(KEY_TOTAL_MINING_TIME_MS, 0L).coerceAtLeast(0L)
+        val elapsed = (nowMs - start).coerceAtLeast(0L)
+        val checkpointTotal = baseTotalMs + elapsed
+        prefs.edit()
+            .putLong(KEY_MINING_TIME_CHECKPOINT_SESSION_START_MS, start)
+            .putLong(KEY_MINING_TIME_CHECKPOINT_TOTAL_MS, checkpointTotal)
+            .putLong(KEY_MINING_TIME_CHECKPOINT_SAVED_AT_MS, nowMs.coerceAtLeast(0L))
+            .apply()
+    }
+
+    /**
+     * Reconciles crash-safe checkpoint into [KEY_TOTAL_MINING_TIME_MS] using replacement semantics:
+     * persisted total becomes max(existingTotal, checkpointTotal) to prevent double counting.
+     * Returns the reconciled total.
+     */
+    fun reconcileMiningTimeCheckpoint(): Long {
+        val existingTotal = prefs.getLong(KEY_TOTAL_MINING_TIME_MS, 0L).coerceAtLeast(0L)
+        val checkpointTotal = prefs.getLong(KEY_MINING_TIME_CHECKPOINT_TOTAL_MS, 0L).coerceAtLeast(0L)
+        val reconciled = maxOf(existingTotal, checkpointTotal)
+        if (reconciled != existingTotal) {
+            prefs.edit().putLong(KEY_TOTAL_MINING_TIME_MS, reconciled).apply()
+        }
+        clearMiningTimeCheckpoint()
+        return reconciled
+    }
+
+    /** Clears in-progress mining-time checkpoint markers. */
+    fun clearMiningTimeCheckpoint() {
+        prefs.edit()
+            .remove(KEY_MINING_TIME_CHECKPOINT_SESSION_START_MS)
+            .remove(KEY_MINING_TIME_CHECKPOINT_TOTAL_MS)
+            .remove(KEY_MINING_TIME_CHECKPOINT_SAVED_AT_MS)
+            .apply()
+    }
+
+    /** `sessionMs == 0` means UI shows False. */
+    fun getHeatStopSessionMs(): Long = prefs.getLong(KEY_HEAT_STOP_SESSION_MS, 0L)
+
+    fun getHeatStopTempCelsius(): Float =
+        Float.fromBits(prefs.getInt(KEY_HEAT_STOP_TEMP_CELSIUS_BITS, 0))
+
+    fun setHeatStopSnapshot(sessionMs: Long, tempCelsius: Float) {
+        prefs.edit()
+            .putLong(KEY_HEAT_STOP_SESSION_MS, sessionMs.coerceAtLeast(0L))
+            .putInt(KEY_HEAT_STOP_TEMP_CELSIUS_BITS, tempCelsius.toRawBits())
+            .apply()
+    }
+
+    fun clearHeatStopForNewSession() {
+        prefs.edit()
+            .putLong(KEY_HEAT_STOP_SESSION_MS, 0L)
+            .putInt(KEY_HEAT_STOP_TEMP_CELSIUS_BITS, HEAT_STOP_TEMP_INACTIVE_BITS)
+            .apply()
+    }
+
+    fun isMiningRequested(): Boolean = prefs.getBoolean(KEY_MINING_REQUESTED, false)
+
+    fun setMiningRequested(requested: Boolean) {
+        prefs.edit().putBoolean(KEY_MINING_REQUESTED, requested).apply()
+    }
+
+    fun getSessionAccumulatedHashedMs(): Long = prefs.getLong(KEY_SESSION_ACCUMULATED_HASHED_MS, 0L).coerceAtLeast(0L)
+
+    fun saveSessionAccumulatedHashedMs(ms: Long) {
+        prefs.edit().putLong(KEY_SESSION_ACCUMULATED_HASHED_MS, ms.coerceAtLeast(0L)).apply()
+    }
+
+    fun getResumeAttemptCount(): Long = prefs.getLong(KEY_RESUME_ATTEMPT_COUNT, 0L).coerceAtLeast(0L)
+
+    fun incrementResumeAttemptCount(): Long {
+        val next = getResumeAttemptCount() + 1L
+        prefs.edit().putLong(KEY_RESUME_ATTEMPT_COUNT, next).apply()
+        return next
+    }
+
+    fun clearResumeAttemptCount() {
+        prefs.edit().putLong(KEY_RESUME_ATTEMPT_COUNT, 0L).apply()
+    }
+
+    data class ShareSessionBaselines(
+        val accepted: Long,
+        val rejected: Long,
+        val identified: Long,
+        val identifiedCpu: Long,
+        val identifiedGpu: Long,
+        val blockTemplates: Long,
+    )
+
+    fun saveShareSessionBaselines(baselines: ShareSessionBaselines) {
+        prefs.edit()
+            .putLong(KEY_SESSION_BASELINE_ACCEPTED, baselines.accepted.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_REJECTED, baselines.rejected.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_IDENTIFIED, baselines.identified.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_IDENTIFIED_CPU, baselines.identifiedCpu.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_IDENTIFIED_GPU, baselines.identifiedGpu.coerceAtLeast(0L))
+            .putLong(KEY_SESSION_BASELINE_BLOCK_TEMPLATES, baselines.blockTemplates.coerceAtLeast(0L))
+            .apply()
+    }
+
+    fun getShareSessionBaselines(): ShareSessionBaselines = ShareSessionBaselines(
+        accepted = prefs.getLong(KEY_SESSION_BASELINE_ACCEPTED, 0L),
+        rejected = prefs.getLong(KEY_SESSION_BASELINE_REJECTED, 0L),
+        identified = prefs.getLong(KEY_SESSION_BASELINE_IDENTIFIED, 0L),
+        identifiedCpu = prefs.getLong(KEY_SESSION_BASELINE_IDENTIFIED_CPU, 0L),
+        identifiedGpu = prefs.getLong(KEY_SESSION_BASELINE_IDENTIFIED_GPU, 0L),
+        blockTemplates = prefs.getLong(KEY_SESSION_BASELINE_BLOCK_TEMPLATES, 0L),
+    )
+
+    fun clearResumeStateForNewSession() {
+        prefs.edit()
+            .putLong(KEY_RESUME_ATTEMPT_COUNT, 0L)
+            .putLong(KEY_SESSION_ACCUMULATED_HASHED_MS, 0L)
+            .apply()
+    }
+
+    /** Saves the latest chart snapshot for idle/crash restore. */
+    fun saveChartSnapshot(
+        cpu: List<Double>,
+        gpu: List<Double>,
+        elapsedSec: List<Float>,
+        batteryTempC: List<Float>,
+        donutCpuShares: Long,
+        donutGpuShares: Long,
+        sessionStartMs: Long,
+        savedAtMs: Long = System.currentTimeMillis(),
+        cpussAvgC: List<Float> = emptyList(),
+        cpuAvgC: List<Float> = emptyList(),
+        gpussAvgC: List<Float> = emptyList(),
+        gpuAvgC: List<Float> = emptyList(),
+        skinC: List<Float> = emptyList(),
+        telemetryBatteryAvgC: List<Float> = emptyList(),
+        cpuClkMhz: List<Float> = emptyList(),
+        gpuClkMhz: List<Float> = emptyList(),
+        avgWorkMs: List<Float> = emptyList(),
+    ) {
+        val n = minOf(cpu.size, gpu.size, elapsedSec.size, batteryTempC.size)
+        if (n <= 0) return
+
+        val bounded = downsampleForSnapshot(
+            cpu = cpu.subList(0, n),
+            gpu = gpu.subList(0, n),
+            elapsedSec = elapsedSec.subList(0, n),
+            batteryTempC = batteryTempC.subList(0, n),
+            cpussAvgC = cpussAvgC.take(n),
+            cpuAvgC = cpuAvgC.take(n),
+            gpussAvgC = gpussAvgC.take(n),
+            gpuAvgC = gpuAvgC.take(n),
+            skinC = skinC.take(n),
+            telemetryBatteryAvgC = telemetryBatteryAvgC.take(n),
+            cpuClkMhz = cpuClkMhz.take(n),
+            gpuClkMhz = gpuClkMhz.take(n),
+            avgWorkMs = avgWorkMs.take(n),
+        )
+
+        runCatching {
+            val json = JSONObject().apply {
+                put("v", CHART_SNAPSHOT_VERSION)
+                put("sessionStartMs", sessionStartMs.coerceAtLeast(0L))
+                put("savedAtMs", savedAtMs.coerceAtLeast(0L))
+                put("donutCpuShares", donutCpuShares.coerceAtLeast(0L))
+                put("donutGpuShares", donutGpuShares.coerceAtLeast(0L))
+                put("cpu", JSONArray().apply { bounded.cpu.forEach { put(it.finiteOrZero()) } })
+                put("gpu", JSONArray().apply { bounded.gpu.forEach { put(it.finiteOrZero()) } })
+                put("elapsedSec", JSONArray().apply { bounded.elapsedSec.forEach { put(it.finiteOrZero()) } })
+                // Preserve unavailable battery samples without writing forbidden NaN/Infinity to JSON.
+                put("batteryTempC", JSONArray().apply {
+                    bounded.batteryTempC.forEach {
+                        if (it.isFinite()) put(it) else put(JSONObject.NULL)
+                    }
+                })
+                putOptionalNaNFloatArray("cpussAvgC", bounded.cpussAvgC)
+                putOptionalNaNFloatArray("cpuAvgC", bounded.cpuAvgC)
+                putOptionalNaNFloatArray("gpussAvgC", bounded.gpussAvgC)
+                putOptionalNaNFloatArray("gpuAvgC", bounded.gpuAvgC)
+                putOptionalNaNFloatArray("skinC", bounded.skinC)
+                putOptionalNaNFloatArray("telemetryBatteryAvgC", bounded.telemetryBatteryAvgC)
+                putOptionalNaNFloatArray("cpuClkMhz", bounded.cpuClkMhz)
+                putOptionalNaNFloatArray("gpuClkMhz", bounded.gpuClkMhz)
+                putOptionalNaNFloatArray("avgWorkMs", bounded.avgWorkMs)
+            }
+
+            prefs.edit()
+                .putString(KEY_CHART_SNAPSHOT_JSON, json.toString())
+                .putLong(KEY_CHART_SNAPSHOT_SAVED_AT_MS, savedAtMs.coerceAtLeast(0L))
+                .putLong(KEY_CHART_SNAPSHOT_SESSION_START_MS, sessionStartMs.coerceAtLeast(0L))
+                .apply()
+        }.onFailure { e ->
+            AppLog.e(LOG_TAG) { "saveChartSnapshot failed: ${e.message}" }
+        }
+    }
+
+    /** Returns latest chart snapshot if present and not stale. */
+    fun getChartSnapshotOrNull(nowMs: Long = System.currentTimeMillis()): ChartSnapshot? {
+        val raw = prefs.getString(KEY_CHART_SNAPSHOT_JSON, null) ?: return null
+        val json = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+        val savedAtMs = json.optLong("savedAtMs", 0L).coerceAtLeast(0L)
+        if (savedAtMs > 0L && nowMs - savedAtMs > CHART_SNAPSHOT_STALE_MS) return null
+
+        val cpu = json.optJSONArray("cpu")?.toFiniteFloatList(defaultValue = 0f) ?: return null
+        val gpu = json.optJSONArray("gpu")?.toFiniteFloatList(defaultValue = 0f) ?: return null
+        val elapsedSec = json.optJSONArray("elapsedSec")?.toFiniteFloatList(defaultValue = 0f) ?: return null
+        val batteryTempC = json.optJSONArray("batteryTempC")?.toBatteryTempFloatList() ?: return null
+        val n = minOf(cpu.size, gpu.size, elapsedSec.size, batteryTempC.size)
+        if (n <= 0) return null
+
+        return ChartSnapshot(
+            version = json.optInt("v", CHART_SNAPSHOT_VERSION),
+            sessionStartMs = json.optLong("sessionStartMs", 0L).coerceAtLeast(0L),
+            savedAtMs = savedAtMs,
+            donutCpuShares = json.optLong("donutCpuShares", 0L).coerceAtLeast(0L),
+            donutGpuShares = json.optLong("donutGpuShares", 0L).coerceAtLeast(0L),
+            cpu = cpu.subList(0, n),
+            gpu = gpu.subList(0, n),
+            elapsedSec = elapsedSec.subList(0, n),
+            batteryTempC = batteryTempC.subList(0, n),
+            cpussAvgC = json.optJSONArray("cpussAvgC")?.toOptionalFloatList(n) ?: emptyList(),
+            cpuAvgC = json.optJSONArray("cpuAvgC")?.toOptionalFloatList(n) ?: emptyList(),
+            gpussAvgC = json.optJSONArray("gpussAvgC")?.toOptionalFloatList(n) ?: emptyList(),
+            gpuAvgC = json.optJSONArray("gpuAvgC")?.toOptionalFloatList(n) ?: emptyList(),
+            skinC = json.optJSONArray("skinC")?.toOptionalFloatList(n) ?: emptyList(),
+            telemetryBatteryAvgC = json.optJSONArray("telemetryBatteryAvgC")?.toOptionalFloatList(n) ?: emptyList(),
+            cpuClkMhz = json.optJSONArray("cpuClkMhz")?.toOptionalFloatList(n) ?: emptyList(),
+            gpuClkMhz = json.optJSONArray("gpuClkMhz")?.toOptionalFloatList(n) ?: emptyList(),
+            avgWorkMs = json.optJSONArray("avgWorkMs")?.toOptionalFloatList(n) ?: emptyList(),
+        )
+    }
+
+    /** Clears latest chart snapshot. */
+    fun clearChartSnapshot() {
+        prefs.edit()
+            .remove(KEY_CHART_SNAPSHOT_JSON)
+            .remove(KEY_CHART_SNAPSHOT_SAVED_AT_MS)
+            .remove(KEY_CHART_SNAPSHOT_SESSION_START_MS)
+            .apply()
+    }
+
+    fun saveFractalChartState(
+        sdPrev: Double,
+        sdNew: Double,
+        sessionLnAnchor: Double,
+        sessionLnPeak: Double,
+        rollingLnMin: Double?,
+        rollingLnMax: Double?,
+        fractalPlotOrdinal: Int,
+        lastPlotKindOrdinal: Int,
+    ) {
+        if (!sdPrev.isFinite() || !sdNew.isFinite() || sdNew <= 0.0) return
+        if (!sessionLnAnchor.isFinite() || !sessionLnPeak.isFinite()) return
+        val nKinds = FractalPlotKind.entries.size
+        if (lastPlotKindOrdinal !in 0 until nKinds) return
+        if (fractalPlotOrdinal !in -1 until nKinds) return
+        rollingLnMin?.let { if (!it.isFinite()) return }
+        rollingLnMax?.let { if (!it.isFinite()) return }
+        runCatching {
+            val o = JSONObject().apply {
+                put("v", FRACTAL_CHART_STATE_VERSION)
+                put("sdPrev", sdPrev)
+                put("sdNew", sdNew)
+                put("sessionLnAnchor", sessionLnAnchor)
+                put("sessionLnPeak", sessionLnPeak)
+                rollingLnMin?.let { put("rollingLnMin", it) }
+                rollingLnMax?.let { put("rollingLnMax", it) }
+                put("fractalPlotOrdinal", fractalPlotOrdinal)
+                put("lastPlotKindOrdinal", lastPlotKindOrdinal)
+            }
+            prefs.edit().putString(KEY_FRACTAL_CHART_STATE_JSON, o.toString()).apply()
+        }.onFailure { e ->
+            AppLog.e(LOG_TAG) { "saveFractalChartState failed: ${e.message}" }
+        }
+    }
+
+    fun loadFractalChartState(): PersistedFractalChartState? {
+        val raw = prefs.getString(KEY_FRACTAL_CHART_STATE_JSON, null) ?: return null
+        val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+        if (root.optInt("v", 0) != FRACTAL_CHART_STATE_VERSION) return null
+        val sdPrev = root.optDouble("sdPrev", Double.NaN)
+        val sdNew = root.optDouble("sdNew", Double.NaN)
+        val sessionLnAnchor = root.optDouble("sessionLnAnchor", Double.NaN)
+        val sessionLnPeak = root.optDouble("sessionLnPeak", Double.NaN)
+        val rollingLnMin = if (root.has("rollingLnMin")) {
+            val x = root.optDouble("rollingLnMin", Double.NaN)
+            if (!x.isFinite()) return null
+            x
+        } else null
+        val rollingLnMax = if (root.has("rollingLnMax")) {
+            val x = root.optDouble("rollingLnMax", Double.NaN)
+            if (!x.isFinite()) return null
+            x
+        } else null
+        val fractalPlotOrdinal = root.optInt("fractalPlotOrdinal", -999)
+        val lastPlotKindOrdinal = root.optInt("lastPlotKindOrdinal", -999)
+        val nKinds = FractalPlotKind.entries.size
+        if (!sdPrev.isFinite() || !sdNew.isFinite() || sdNew <= 0.0) return null
+        if (!sessionLnAnchor.isFinite() || !sessionLnPeak.isFinite()) return null
+        if (lastPlotKindOrdinal !in 0 until nKinds) return null
+        if (fractalPlotOrdinal !in -1 until nKinds) return null
+        return PersistedFractalChartState(
+            sdPrev = sdPrev,
+            sdNew = sdNew,
+            sessionLnAnchor = sessionLnAnchor,
+            sessionLnPeak = sessionLnPeak,
+            rollingLnMin = rollingLnMin,
+            rollingLnMax = rollingLnMax,
+            fractalPlotOrdinal = fractalPlotOrdinal,
+            lastPlotKindOrdinal = lastPlotKindOrdinal,
+        )
+    }
+
+    fun clearFractalChartState() {
+        prefs.edit().remove(KEY_FRACTAL_CHART_STATE_JSON).apply()
+    }
+
+    /** Persists latest thermal treemap readings for idle / process-death restore. */
+    fun saveThermalChartState(state: ThermalUiState) {
+        if (state.readings.isEmpty()) return
+        runCatching {
+            prefs.edit()
+                .putString(KEY_THERMAL_CHART_JSON, ThermalChartStateCodec.encode(state))
+                .apply()
+        }.onFailure { e ->
+            AppLog.e(LOG_TAG) { "saveThermalChartState failed: ${e.message}" }
+        }
+    }
+
+    fun loadThermalChartState(): PersistedThermalChartState? {
+        val raw = prefs.getString(KEY_THERMAL_CHART_JSON, null) ?: return null
+        return ThermalChartStateCodec.decode(raw)
+    }
+
+    fun clearThermalChartState() {
+        prefs.edit().remove(KEY_THERMAL_CHART_JSON).apply()
+    }
+
+    /**
+     * Writes zeros for the five persisted counters. Used only when user resets via Config.
+     */
+    fun saveZeros() {
+        prefs.edit()
+            .putLong(KEY_ACCEPTED_SHARES, 0L)
+            .putLong(KEY_REJECTED_SHARES, 0L)
+            .putLong(KEY_IDENTIFIED_SHARES, 0L)
+            .putLong(KEY_BEST_DIFFICULTY, 0.0.toRawBits())
+            .putLong(KEY_BLOCK_TEMPLATES, 0L)
+            .putLong(KEY_LIFETIME_SUM_SESSION_AVG_CPU_HS, 0.0.toRawBits())
+            .putLong(KEY_LIFETIME_SUM_SESSION_AVG_GPU_HS, 0.0.toRawBits())
+            .putLong(KEY_LIFETIME_TOTAL_NONCES, 0L)
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_ACCEPTED, 0L)
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_REJECTED, 0L)
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_IDENTIFIED, 0L)
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_BEST_DIFFICULTY, 0.0.toRawBits())
+            .putLong(KEY_LAST_STOPPED_SESSION_DISPLAY_BLOCK_TEMPLATES_DELTA, 0L)
+            .remove(KEY_LAST_STOPPED_SESSION_START_WALL_MS)
+            .putLong(KEY_TOTAL_MINING_TIME_MS, 0L)
+            .remove(KEY_CHART_SNAPSHOT_JSON)
+            .remove(KEY_CHART_SNAPSHOT_SAVED_AT_MS)
+            .remove(KEY_CHART_SNAPSHOT_SESSION_START_MS)
+            .remove(KEY_MINING_TIME_CHECKPOINT_SESSION_START_MS)
+            .remove(KEY_MINING_TIME_CHECKPOINT_TOTAL_MS)
+            .remove(KEY_MINING_TIME_CHECKPOINT_SAVED_AT_MS)
+            .remove(KEY_BEST_DIFFICULTY_EVENTS_JSON)
+            .remove(KEY_FRACTAL_CHART_STATE_JSON)
+            .apply()
+    }
+
+    /** Append-only history for best-difficulty chart; trimmed FIFO when over cap. Not cleared by chart snapshot clear. */
+    fun appendBestDifficultyEvent(tWallMs: Long, difficulty: Double, sessionStartWallMs: Long) {
+        val t = tWallMs.coerceAtLeast(0L)
+        val ss = sessionStartWallMs.coerceAtLeast(0L)
+        if (!difficulty.isFinite() || difficulty <= 0.0 || t <= 0L || ss <= 0L) return
+
+        runCatching {
+            val raw = prefs.getString(KEY_BEST_DIFFICULTY_EVENTS_JSON, null)
+            val arr = when {
+                raw.isNullOrEmpty() -> JSONArray()
+                else -> {
+                    val root = runCatching { JSONObject(raw) }.getOrNull()
+                    root?.optJSONArray("events") ?: JSONArray()
+                }
+            }
+            arr.put(
+                JSONObject().apply {
+                    put("t", t)
+                    put("d", difficulty)
+                    put("ss", ss)
+                },
+            )
+            val trimmed = JSONArray()
+            val startIdx = maxOf(0, arr.length() - BEST_DIFFICULTY_EVENTS_MAX)
+            for (i in startIdx until arr.length()) {
+                trimmed.put(arr.get(i))
+            }
+            prefs.edit()
+                .putString(
+                    KEY_BEST_DIFFICULTY_EVENTS_JSON,
+                    JSONObject().apply {
+                        put("v", BEST_DIFFICULTY_EVENTS_VERSION)
+                        put("events", trimmed)
+                    }.toString(),
+                )
+                .apply()
+        }.onFailure { e ->
+            AppLog.e(LOG_TAG) { "appendBestDifficultyEvent failed: ${e.message}" }
+        }
+    }
+
+    /** Ordered oldest-first; empty if missing or invalid. */
+    fun getBestDifficultyEvents(): List<BestDifficultyChartEvent> {
+        val raw = prefs.getString(KEY_BEST_DIFFICULTY_EVENTS_JSON, null) ?: return emptyList()
+        val root = runCatching { JSONObject(raw) }.getOrNull() ?: return emptyList()
+        val arr = root.optJSONArray("events") ?: return emptyList()
+        val out = ArrayList<BestDifficultyChartEvent>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val t = o.optLong("t", 0L)
+            val d = o.optDouble("d", Double.NaN)
+            val ss = o.optLong("ss", 0L)
+            if (t > 0L && ss > 0L && d.isFinite() && d > 0.0) {
+                out.add(BestDifficultyChartEvent(tWallMs = t, difficulty = d, sessionStartWallMs = ss))
+            }
+        }
+        return out
+    }
+
+    /** Lifetime aggregates shown on dashboard page 2. */
+    fun getLifetimeStats(): LifetimeMiningStats {
+        return LifetimeMiningStats(
+            sumSessionAvgCpuHs = Double.fromBits(prefs.getLong(KEY_LIFETIME_SUM_SESSION_AVG_CPU_HS, 0L)),
+            sumSessionAvgGpuHs = Double.fromBits(prefs.getLong(KEY_LIFETIME_SUM_SESSION_AVG_GPU_HS, 0L)),
+            totalNonces = prefs.getLong(KEY_LIFETIME_TOTAL_NONCES, 0L),
+        )
+    }
+
+    /**
+     * Called when a mining session ends. Adds [sessionNonces] to the lifetime nonce total.
+     * Adds [sessionAvgCpuHs] / [sessionAvgGpuHs] to lifetime sums only if greater than [LIFETIME_HASHRATE_EPSILON].
+     */
+    fun addLifetimeSessionContribution(sessionNonces: Long, sessionAvgCpuHs: Double, sessionAvgGpuHs: Double) {
+        val ed = prefs.edit()
+        if (sessionNonces > 0) {
+            ed.putLong(KEY_LIFETIME_TOTAL_NONCES, prefs.getLong(KEY_LIFETIME_TOTAL_NONCES, 0L) + sessionNonces)
+        }
+        if (sessionAvgCpuHs > LIFETIME_HASHRATE_EPSILON) {
+            val cur = Double.fromBits(prefs.getLong(KEY_LIFETIME_SUM_SESSION_AVG_CPU_HS, 0L))
+            ed.putLong(KEY_LIFETIME_SUM_SESSION_AVG_CPU_HS, (cur + sessionAvgCpuHs).toRawBits())
+        }
+        if (sessionAvgGpuHs > LIFETIME_HASHRATE_EPSILON) {
+            val cur = Double.fromBits(prefs.getLong(KEY_LIFETIME_SUM_SESSION_AVG_GPU_HS, 0L))
+            ed.putLong(KEY_LIFETIME_SUM_SESSION_AVG_GPU_HS, (cur + sessionAvgGpuHs).toRawBits())
+        }
+        ed.apply()
+    }
+
+    companion object {
+        /** Ignore negligible averages when accumulating lifetime hash-rate sums. */
+        const val LIFETIME_HASHRATE_EPSILON = 1e-6
+
+        private const val PREFS_NAME = "mining_stats"
+        private const val KEY_ACCEPTED_SHARES = "accepted_shares"
+        private const val KEY_REJECTED_SHARES = "rejected_shares"
+        private const val KEY_IDENTIFIED_SHARES = "identified_shares"
+        private const val KEY_BEST_DIFFICULTY = "best_difficulty"
+        private const val KEY_BLOCK_TEMPLATES = "block_templates"
+        private const val KEY_LAST_RUN_DURATION_MS = "last_run_duration_ms"
+        private const val KEY_LIFETIME_SUM_SESSION_AVG_CPU_HS = "lifetime_sum_session_avg_cpu_hs"
+        private const val KEY_LIFETIME_SUM_SESSION_AVG_GPU_HS = "lifetime_sum_session_avg_gpu_hs"
+        private const val KEY_LIFETIME_TOTAL_NONCES = "lifetime_total_nonces"
+        private const val KEY_LAST_STOPPED_SESSION_DISPLAY_ACCEPTED = "last_stopped_session_display_accepted"
+        private const val KEY_LAST_STOPPED_SESSION_DISPLAY_REJECTED = "last_stopped_session_display_rejected"
+        private const val KEY_LAST_STOPPED_SESSION_DISPLAY_IDENTIFIED = "last_stopped_session_display_identified"
+        private const val KEY_LAST_STOPPED_SESSION_DISPLAY_BEST_DIFFICULTY = "last_stopped_session_display_best_difficulty"
+        private const val KEY_LAST_STOPPED_SESSION_DISPLAY_BLOCK_TEMPLATES_DELTA = "last_stopped_session_display_block_templates_delta"
+        private const val KEY_LAST_STOPPED_SESSION_START_WALL_MS = "last_stopped_session_start_wall_ms"
+        private const val KEY_TOTAL_MINING_TIME_MS = "total_mining_time_ms"
+        private const val KEY_MINING_TIME_CHECKPOINT_SESSION_START_MS = "mining_time_checkpoint_session_start_ms"
+        private const val KEY_MINING_TIME_CHECKPOINT_TOTAL_MS = "mining_time_checkpoint_total_ms"
+        private const val KEY_MINING_TIME_CHECKPOINT_SAVED_AT_MS = "mining_time_checkpoint_saved_at_ms"
+        private const val KEY_CHART_SNAPSHOT_JSON = "chart_snapshot_json"
+        private const val KEY_CHART_SNAPSHOT_SAVED_AT_MS = "chart_snapshot_saved_at_ms"
+        private const val KEY_CHART_SNAPSHOT_SESSION_START_MS = "chart_snapshot_session_start_ms"
+        private const val CHART_SNAPSHOT_VERSION = 2
+        private const val CHART_SNAPSHOT_MAX_POINTS = 1_200
+        private const val CHART_SNAPSHOT_STALE_MS = 24 * 60 * 60 * 1000L
+        private const val KEY_BEST_DIFFICULTY_EVENTS_JSON = "best_difficulty_events_json"
+        private const val BEST_DIFFICULTY_EVENTS_VERSION = 1
+        private const val BEST_DIFFICULTY_EVENTS_MAX = 3000
+        private const val KEY_FRACTAL_CHART_STATE_JSON = "fractal_chart_state_json"
+        private const val FRACTAL_CHART_STATE_VERSION = 1
+        private const val KEY_THERMAL_CHART_JSON = "thermal_chart_json"
+        private const val LOG_TAG = "MiningStatsRepository"
+        private const val KEY_HEAT_STOP_SESSION_MS = "heat_stop_session_ms"
+        private const val KEY_HEAT_STOP_TEMP_CELSIUS_BITS = "heat_stop_temp_c_bits"
+        private val HEAT_STOP_TEMP_INACTIVE_BITS = Float.NaN.toRawBits()
+        private const val KEY_MINING_REQUESTED = "mining_requested"
+        private const val KEY_SESSION_ACCUMULATED_HASHED_MS = "session_accumulated_hashed_ms"
+        private const val KEY_RESUME_ATTEMPT_COUNT = "resume_attempt_count"
+        private const val KEY_SESSION_BASELINE_ACCEPTED = "session_baseline_accepted"
+        private const val KEY_SESSION_BASELINE_REJECTED = "session_baseline_rejected"
+        private const val KEY_SESSION_BASELINE_IDENTIFIED = "session_baseline_identified"
+        private const val KEY_SESSION_BASELINE_IDENTIFIED_CPU = "session_baseline_identified_cpu"
+        private const val KEY_SESSION_BASELINE_IDENTIFIED_GPU = "session_baseline_identified_gpu"
+        private const val KEY_SESSION_BASELINE_BLOCK_TEMPLATES = "session_baseline_block_templates"
+    }
+
+    private fun downsampleForSnapshot(
+        cpu: List<Double>,
+        gpu: List<Double>,
+        elapsedSec: List<Float>,
+        batteryTempC: List<Float>,
+        cpussAvgC: List<Float> = emptyList(),
+        cpuAvgC: List<Float> = emptyList(),
+        gpussAvgC: List<Float> = emptyList(),
+        gpuAvgC: List<Float> = emptyList(),
+        skinC: List<Float> = emptyList(),
+        telemetryBatteryAvgC: List<Float> = emptyList(),
+        cpuClkMhz: List<Float> = emptyList(),
+        gpuClkMhz: List<Float> = emptyList(),
+        avgWorkMs: List<Float> = emptyList(),
+    ): ChartSnapshotSeries {
+        if (cpu.size <= CHART_SNAPSHOT_MAX_POINTS) {
+            return ChartSnapshotSeries(
+                cpu = cpu.map { it.toFloat() },
+                gpu = gpu.map { it.toFloat() },
+                elapsedSec = elapsedSec.toList(),
+                batteryTempC = batteryTempC.toList(),
+                cpussAvgC = cpussAvgC.toList(),
+                cpuAvgC = cpuAvgC.toList(),
+                gpussAvgC = gpussAvgC.toList(),
+                gpuAvgC = gpuAvgC.toList(),
+                skinC = skinC.toList(),
+                telemetryBatteryAvgC = telemetryBatteryAvgC.toList(),
+                cpuClkMhz = cpuClkMhz.toList(),
+                gpuClkMhz = gpuClkMhz.toList(),
+                avgWorkMs = avgWorkMs.toList(),
+            )
+        }
+        val step = ceil(cpu.size.toDouble() / CHART_SNAPSHOT_MAX_POINTS.toDouble()).toInt().coerceAtLeast(1)
+        val last = cpu.lastIndex
+        val keepIdx = ArrayList<Int>(CHART_SNAPSHOT_MAX_POINTS + 1)
+        var i = 0
+        while (i <= last) {
+            keepIdx.add(i)
+            i += step
+        }
+        if (keepIdx.lastOrNull() != last) keepIdx.add(last)
+        fun pick(list: List<Float>, idx: Int): Float = list.getOrElse(idx) { Float.NaN }
+        return ChartSnapshotSeries(
+            cpu = keepIdx.map { idx -> cpu[idx].toFloat() },
+            gpu = keepIdx.map { idx -> gpu[idx].toFloat() },
+            elapsedSec = keepIdx.map { idx -> elapsedSec[idx] },
+            batteryTempC = keepIdx.map { idx -> batteryTempC[idx] },
+            cpussAvgC = keepIdx.map { idx -> pick(cpussAvgC, idx) },
+            cpuAvgC = keepIdx.map { idx -> pick(cpuAvgC, idx) },
+            gpussAvgC = keepIdx.map { idx -> pick(gpussAvgC, idx) },
+            gpuAvgC = keepIdx.map { idx -> pick(gpuAvgC, idx) },
+            skinC = keepIdx.map { idx -> pick(skinC, idx) },
+            telemetryBatteryAvgC = keepIdx.map { idx -> pick(telemetryBatteryAvgC, idx) },
+            cpuClkMhz = keepIdx.map { idx -> pick(cpuClkMhz, idx) },
+            gpuClkMhz = keepIdx.map { idx -> pick(gpuClkMhz, idx) },
+            avgWorkMs = keepIdx.map { idx -> pick(avgWorkMs, idx) },
+        )
+    }
+
+    private fun JSONObject.putOptionalNaNFloatArray(key: String, values: List<Float>) {
+        put(key, JSONArray().apply {
+            values.forEach { v ->
+                if (v.isFinite()) put(v) else put(JSONObject.NULL)
+            }
+        })
+    }
+
+    private fun JSONArray.toOptionalFloatList(expectedSize: Int): List<Float> {
+        val out = ArrayList<Float>(expectedSize)
+        for (i in 0 until expectedSize) {
+            if (i >= length()) {
+                out.add(Float.NaN)
+                continue
+            }
+            if (isNull(i)) {
+                out.add(Float.NaN)
+                continue
+            }
+            val f = optDouble(i, Double.NaN).toFloat()
+            out.add(if (f.isFinite()) f else Float.NaN)
+        }
+        return out
+    }
+
+    private fun JSONArray.toFiniteFloatList(defaultValue: Float): List<Float> {
+        val out = ArrayList<Float>(length())
+        for (i in 0 until length()) {
+            val d = optDouble(i, defaultValue.toDouble())
+            val f = d.toFloat()
+            out.add(if (f.isFinite()) f else defaultValue)
+        }
+        return out
+    }
+
+    private fun JSONArray.toBatteryTempFloatList(): List<Float> {
+        val out = ArrayList<Float>(length())
+        for (i in 0 until length()) {
+            if (isNull(i)) {
+                out.add(Float.NaN)
+                continue
+            }
+            val d = optDouble(i, Double.NaN)
+            val f = d.toFloat()
+            out.add(if (f.isFinite()) f else Float.NaN)
+        }
+        return out
+    }
+
+    private fun Float.finiteOrZero(): Float = if (isFinite()) this else 0f
+}
+
+data class LifetimeMiningStats(
+    val sumSessionAvgCpuHs: Double,
+    val sumSessionAvgGpuHs: Double,
+    val totalNonces: Long,
+) {
+    val sumSessionAvgTotalHs: Double get() = sumSessionAvgCpuHs + sumSessionAvgGpuHs
+}
+
+data class ChartSnapshot(
+    val version: Int,
+    val sessionStartMs: Long,
+    val savedAtMs: Long,
+    val donutCpuShares: Long,
+    val donutGpuShares: Long,
+    val cpu: List<Float>,
+    val gpu: List<Float>,
+    val elapsedSec: List<Float>,
+    val batteryTempC: List<Float>,
+    val cpussAvgC: List<Float> = emptyList(),
+    val cpuAvgC: List<Float> = emptyList(),
+    val gpussAvgC: List<Float> = emptyList(),
+    val gpuAvgC: List<Float> = emptyList(),
+    val skinC: List<Float> = emptyList(),
+    val telemetryBatteryAvgC: List<Float> = emptyList(),
+    val cpuClkMhz: List<Float> = emptyList(),
+    val gpuClkMhz: List<Float> = emptyList(),
+    val avgWorkMs: List<Float> = emptyList(),
+)
+
+/** Single session-best improvement for best-difficulty scatter chart ([MiningStatsRepository.appendBestDifficultyEvent]). */
+data class BestDifficultyChartEvent(
+    val tWallMs: Long,
+    val difficulty: Double,
+    val sessionStartWallMs: Long,
+)
+
+private data class ChartSnapshotSeries(
+    val cpu: List<Float>,
+    val gpu: List<Float>,
+    val elapsedSec: List<Float>,
+    val batteryTempC: List<Float>,
+    val cpussAvgC: List<Float> = emptyList(),
+    val cpuAvgC: List<Float> = emptyList(),
+    val gpussAvgC: List<Float> = emptyList(),
+    val gpuAvgC: List<Float> = emptyList(),
+    val skinC: List<Float> = emptyList(),
+    val telemetryBatteryAvgC: List<Float> = emptyList(),
+    val cpuClkMhz: List<Float> = emptyList(),
+    val gpuClkMhz: List<Float> = emptyList(),
+    val avgWorkMs: List<Float> = emptyList(),
+)
