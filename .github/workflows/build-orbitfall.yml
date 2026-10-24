@@ -1,0 +1,87 @@
+name: Build Orbitfall Android APK
+
+on:
+  push:
+    branches:
+      - game/orbitfall
+    paths:
+      - 'orbitfall/**'
+      - '.github/workflows/build-orbitfall.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: orbitfall-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build tools
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build release APK
+        working-directory: orbitfall
+        run: gradle --no-daemon assembleRelease
+
+      - name: Sign and verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/orbitfall-release.jks"
+          keytool -genkeypair -noprompt -v \
+            -keystore "$KEYSTORE" \
+            -storepass orbitfall-local-build \
+            -keypass orbitfall-local-build \
+            -alias orbitfall \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Orbitfall Release, OU=Android, O=Orbitfall, L=Helsinki, ST=Uusimaa, C=FI"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias orbitfall \
+            --ks-pass pass:orbitfall-local-build \
+            --key-pass pass:orbitfall-local-build \
+            --out Orbitfall.apk \
+            orbitfall/app/build/outputs/apk/release/app-release-unsigned.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose Orbitfall.apk
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging Orbitfall.apk | head -n 6
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: orbitfall-android-apk
+          path: Orbitfall.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="orbitfall-v1.0.${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" Orbitfall.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Осколки неба 1.0.${GITHUB_RUN_NUMBER}" \
+            --notes "Первый релиз игры «Осколки неба». APK подписан на этапе CI; офлайн-аркада для Android." \
+            --latest
