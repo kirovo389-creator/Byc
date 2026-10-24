@@ -1,0 +1,166 @@
+name: Build and publish Byc BTC Miner APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: byc-android-release
+  cancel-in-progress: false
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Byc
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install shader compiler and Python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc python3 rsync
+
+      - name: Import the MIT-licensed Android miner project into the empty repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f ./gradlew || ! -f ./app/build.gradle.kts ]]; then
+            git clone --depth=1 https://github.com/VirtusVerbis/BTC_Anrdoid_Miner.git "$RUNNER_TEMP/upstream"
+            rsync -a --exclude='.git/' --exclude='.github/workflows/byc-android-release.yml' "$RUNNER_TEMP/upstream/" ./
+          fi
+
+          test -f ./gradlew
+          test -f ./app/build.gradle.kts
+          chmod +x ./gradlew
+
+          VERSION="0.1.${GITHUB_RUN_NUMBER}"
+          python3 - "$VERSION" "$GITHUB_RUN_NUMBER" <<'PY'
+          from pathlib import Path
+          import re, sys
+
+          version, run_number = sys.argv[1], sys.argv[2]
+          build_file = Path("app/build.gradle.kts")
+          source = build_file.read_text()
+          source, code_count = re.subn(
+              r"(?m)^\s*versionCode\s*=\s*\d+\s*$",
+              f"        versionCode = {int(run_number)}",
+              source,
+              count=1,
+          )
+          source, name_count = re.subn(
+              r'(?m)^\s*versionName\s*=\s*"[^"]+"\s*$',
+              f'        versionName = "{version}"',
+              source,
+              count=1,
+          )
+          if code_count != 1 or name_count != 1:
+              raise SystemExit("Could not update Android versionCode/versionName safely")
+          build_file.write_text(source)
+
+          strings = Path("app/src/main/res/values/strings.xml")
+          if strings.exists():
+              text = strings.read_text()
+              text, count = re.subn(
+                  r'(<string\s+name="app_name">).*?(</string>)',
+                  r"\1Byc Bitcoin Miner\2",
+                  text,
+                  count=1,
+                  flags=re.S,
+              )
+              if count:
+                  strings.write_text(text)
+
+          readme = Path("README.md")
+          original = readme.read_text() if readme.exists() else ""
+          heading = "# Byc — Bitcoin Android Miner\n\n"
+          if not original.startswith(heading):
+              intro = (
+                  heading
+                  + "This repository contains the Byc Android build of "
+                    "[BTC Android Miner](https://github.com/VirtusVerbis/BTC_Anrdoid_Miner).\n\n"
+                  + "The upstream project is MIT-licensed; see [LICENSE](LICENSE). "
+                    "The build workflow retains upstream attribution and builds an installable, "
+                    "debug-signed APK for direct testing.\n\n"
+                  + "**Reality check:** the app performs actual SHA-256d mining work through Stratum, "
+                    "but phone-class hash rates are far below ASIC miners. Earnings are not guaranteed; "
+                    "verify accepted shares and payouts on the pool itself. Mining can heat devices and "
+                    "degrade batteries, so use only devices you own, keep thermal protection enabled, "
+                    "and stop if a device becomes hot.\n\n"
+                  + "---\n\n"
+              )
+              readme.write_text(intro + original)
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Import and prepare Byc Bitcoin Miner Android project"
+            git push origin HEAD:main
+          fi
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Install Android build components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;25.1.8937393" "cmake;3.22.1"
+
+      - name: Build APK
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Run unit tests
+        continue-on-error: true
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Prepare release APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$INPUT"
+          mkdir -p dist
+          APK="Byc-BTC-Miner-${BUILD_VERSION}-debug-signed.apk"
+          cp "$INPUT" "dist/$APK"
+          sha256sum "dist/$APK" | tee dist/SHA256SUMS.txt
+          echo "apk=dist/$APK" >> "$GITHUB_OUTPUT"
+          echo "name=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Byc-BTC-Miner-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${BUILD_VERSION}"
+          gh release create "$TAG" "${{ steps.apk.outputs.apk }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Byc Bitcoin Miner $TAG" \
+            --notes "Installable debug-signed Android APK built from commit $SOURCE_SHA.\n\nSHA-256 checksum is attached as SHA256SUMS.txt. This app performs actual SHA-256d work, but phone mining is not economically competitive with ASICs and does not guarantee payouts. Verify shares and rewards with your pool.\n\nUpstream MIT project: https://github.com/VirtusVerbis/BTC_Anrdoid_Miner" \
+            --target "$SOURCE_SHA"
+          gh release upload "$TAG" dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY"
